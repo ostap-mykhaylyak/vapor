@@ -1,3 +1,361 @@
-#!/bin/bash
-# v-set-cloudflare - Set CloudFlare protection level for a domain
-# Usage: v-set-cloudflare PROTECTION_LEVEL
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+################################################################################
+# Vapor CP - CloudFlare Protection Manager
+# 
+# Sets CloudFlare security protection level for a domain
+# Usage: v-set-cloudflare USER DOMAIN PROTECTION_LEVEL
+# Version: 1.0.0
+################################################################################
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+
+################################################################################
+# Dependencies Check
+################################################################################
+
+check_dependencies() {
+    local deps=("curl" "jq" "grep" "cut")
+    local missing=()
+    
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing[*]}" >&2
+        echo "Install with: apt-get install ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+################################################################################
+# Input Validation
+################################################################################
+
+validate_username() {
+    local user="$1"
+    
+    # Username: alphanumeric, underscore, hyphen, 3-32 chars
+    if [[ ! "$user" =~ ^[a-zA-Z0-9_-]{3,32}$ ]]; then
+        echo "Error: Invalid username format. Must be 3-32 alphanumeric characters, underscore or hyphen." >&2
+        exit 1
+    fi
+    
+    # Check if user exists
+    if ! id "$user" &>/dev/null; then
+        echo "Error: User '$user' does not exist on the system." >&2
+        exit 1
+    fi
+    
+    # Check if user home directory exists
+    if [[ ! -d "/home/$user" ]]; then
+        echo "Error: User home directory '/home/$user' does not exist." >&2
+        exit 1
+    fi
+}
+
+validate_domain() {
+    local domain="$1"
+    
+    # Domain validation: RFC 1035/1123 compliant
+    local domain_regex='^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+    
+    if [[ ! "$domain" =~ $domain_regex ]]; then
+        echo "Error: Invalid domain format '$domain'." >&2
+        echo "Domain must be a valid FQDN (e.g., example.com or sub.example.com)" >&2
+        exit 1
+    fi
+    
+    # Check domain length (max 253 chars per RFC)
+    if [[ ${#domain} -gt 253 ]]; then
+        echo "Error: Domain name too long (max 253 characters)." >&2
+        exit 1
+    fi
+}
+
+validate_protection_level() {
+    local level="$1"
+    local valid_levels=("off" "low" "medium" "high" "under_attack")
+    
+    for valid in "${valid_levels[@]}"; do
+        if [[ "$level" == "$valid" ]]; then
+            return 0
+        fi
+    done
+    
+    echo "Error: Invalid protection level '$level'." >&2
+    echo "Valid options: ${valid_levels[*]}" >&2
+    exit 1
+}
+
+################################################################################
+# CloudFlare Config Validation
+################################################################################
+
+validate_cloudflare_config() {
+    local user="$1"
+    local config_file="/home/$user/conf/cloudflare.conf"
+    
+    # Check if config file exists
+    if [[ ! -f "$config_file" ]]; then
+        echo "Error: CloudFlare configuration file not found at '$config_file'." >&2
+        echo "Please create the configuration file with CF_EMAIL and CF_KEY." >&2
+        exit 1
+    fi
+    
+    # Check file permissions (should not be world-readable)
+    local perms=$(stat -c "%a" "$config_file" 2>/dev/null || stat -f "%OLp" "$config_file" 2>/dev/null)
+    if [[ "${perms: -1}" -gt 0 ]]; then
+        echo "Warning: Configuration file has insecure permissions. Others can read it." >&2
+        echo "Recommended: chmod 600 $config_file" >&2
+    fi
+    
+    # Source and validate config
+    if ! source "$config_file" 2>/dev/null; then
+        echo "Error: Failed to read configuration file '$config_file'." >&2
+        exit 1
+    fi
+    
+    # Validate CF_EMAIL
+    if [[ -z "${CF_EMAIL:-}" ]]; then
+        echo "Error: CF_EMAIL not set in configuration file." >&2
+        exit 1
+    fi
+    
+    # Email format validation
+    local email_regex='^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if [[ ! "$CF_EMAIL" =~ $email_regex ]]; then
+        echo "Error: CF_EMAIL has invalid email format." >&2
+        exit 1
+    fi
+    
+    # Validate CF_KEY
+    if [[ -z "${CF_KEY:-}" ]]; then
+        echo "Error: CF_KEY not set in configuration file." >&2
+        exit 1
+    fi
+    
+    # CloudFlare API key validation (37 chars for Global API Key, 40 for API Token)
+    if [[ ${#CF_KEY} -lt 32 || ${#CF_KEY} -gt 64 ]]; then
+        echo "Error: CF_KEY has invalid length. Expected CloudFlare API key or token." >&2
+        exit 1
+    fi
+    
+    # Check for dangerous characters in credentials
+    if [[ "$CF_EMAIL" =~ [\'\"\\] ]] || [[ "$CF_KEY" =~ [\'\"\\] ]]; then
+        echo "Error: Invalid characters detected in CloudFlare credentials." >&2
+        exit 1
+    fi
+}
+
+################################################################################
+# CloudFlare API Functions
+################################################################################
+
+get_zone_id() {
+    local domain="$1"
+    local email="$2"
+    local key="$3"
+    
+    local response
+    response=$(curl -sf -X GET "https://api.cloudflare.com/client/v4/zones?name=$domain" \
+        -H "X-Auth-Email: $email" \
+        -H "X-Auth-Key: $key" \
+        -H "Content-Type: application/json" 2>&1) || {
+        echo "Error: Failed to connect to CloudFlare API. Check network connectivity." >&2
+        exit 1
+    }
+    
+    # Validate JSON response
+    if ! echo "$response" | jq empty 2>/dev/null; then
+        echo "Error: Invalid JSON response from CloudFlare API." >&2
+        exit 1
+    fi
+    
+    # Check for API errors
+    local success
+    success=$(echo "$response" | jq -r '.success // false')
+    
+    if [[ "$success" != "true" ]]; then
+        local error_msg
+        error_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"')
+        echo "Error: CloudFlare API error: $error_msg" >&2
+        
+        # Check for authentication errors
+        if echo "$response" | jq -e '.errors[] | select(.code == 9103 or .code == 10000)' &>/dev/null; then
+            echo "Hint: Check your CloudFlare credentials in the config file." >&2
+        fi
+        exit 1
+    fi
+    
+    local zone_id
+    zone_id=$(echo "$response" | jq -r '.result[0].id // empty')
+    
+    if [[ -z "$zone_id" ]]; then
+        echo "Error: Domain '$domain' not found in CloudFlare account." >&2
+        echo "Make sure the domain is added to CloudFlare and credentials are correct." >&2
+        exit 1
+    fi
+    
+    echo "$zone_id"
+}
+
+set_security_level() {
+    local zone_id="$1"
+    local level="$2"
+    local email="$3"
+    local key="$4"
+    
+    local response
+    response=$(curl -sf -X PATCH "https://api.cloudflare.com/client/v4/zones/$zone_id/settings/security_level" \
+        -H "X-Auth-Email: $email" \
+        -H "X-Auth-Key: $key" \
+        -H "Content-Type: application/json" \
+        --data "{\"value\":\"$level\"}" 2>&1) || {
+        echo "Error: Failed to update CloudFlare settings." >&2
+        exit 1
+    }
+    
+    # Validate JSON response
+    if ! echo "$response" | jq empty 2>/dev/null; then
+        echo "Error: Invalid JSON response from CloudFlare API." >&2
+        exit 1
+    fi
+    
+    local success
+    success=$(echo "$response" | jq -r '.success // false')
+    
+    if [[ "$success" != "true" ]]; then
+        local error_msg
+        error_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"')
+        echo "Error: Failed to set protection level: $error_msg" >&2
+        exit 1
+    fi
+    
+    return 0
+}
+
+################################################################################
+# Logging
+################################################################################
+
+log_event() {
+    local user="$1"
+    local level="$2"
+    local message="$3"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    local log_dir="/var/log/vapor"
+    local log_file="$log_dir/cloudflare.log"
+    
+    # Create log directory if it doesn't exist
+    if [[ ! -d "$log_dir" ]]; then
+        mkdir -p "$log_dir" 2>/dev/null || true
+    fi
+    
+    # Write log entry
+    if [[ -d "$log_dir" ]]; then
+        echo "[$timestamp] [$level] [user:$user] $message" >> "$log_file" 2>/dev/null || true
+    fi
+}
+
+################################################################################
+# Usage & Help
+################################################################################
+
+show_usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME USER DOMAIN PROTECTION_LEVEL
+
+Set CloudFlare security protection level for a domain.
+
+Arguments:
+    USER               System username (must exist)
+    DOMAIN             Domain name (must be valid FQDN)
+    PROTECTION_LEVEL   Security level: off, low, medium, high, under_attack
+
+Examples:
+    $SCRIPT_NAME john example.com under_attack
+    $SCRIPT_NAME admin mydomain.org medium
+    $SCRIPT_NAME webmaster site.com off
+
+Configuration:
+    CloudFlare credentials must be set in: /home/USER/conf/cloudflare.conf
+    
+    Required variables:
+        CF_EMAIL="your-email@example.com"
+        CF_KEY="your-cloudflare-api-key"
+
+Version: $VERSION
+EOF
+}
+
+################################################################################
+# Main Execution
+################################################################################
+
+main() {
+    # Show help
+    if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+    
+    # Check arguments count
+    if [[ $# -ne 3 ]]; then
+        echo "Error: Invalid number of arguments." >&2
+        echo "Usage: $SCRIPT_NAME USER DOMAIN PROTECTION_LEVEL" >&2
+        echo "Run '$SCRIPT_NAME --help' for more information." >&2
+        exit 1
+    fi
+    
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script must be run as root." >&2
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Parse arguments
+    local user="$1"
+    local domain="$2"
+    local protection="$3"
+    
+    # Validate inputs
+    validate_username "$user"
+    validate_domain "$domain"
+    validate_protection_level "$protection"
+    
+    # Validate CloudFlare configuration
+    validate_cloudflare_config "$user"
+    
+    # Source config (already validated)
+    source "/home/$user/conf/cloudflare.conf"
+    
+    echo "Setting CloudFlare protection level for $domain..."
+    
+    # Get CloudFlare Zone ID
+    local zone_id
+    zone_id=$(get_zone_id "$domain" "$CF_EMAIL" "$CF_KEY")
+    
+    # Set security level
+    set_security_level "$zone_id" "$protection" "$CF_EMAIL" "$CF_KEY"
+    
+    # Success
+    echo "✓ CloudFlare protection level set to '$protection' for $domain"
+    log_event "$user" "INFO" "CloudFlare protection for $domain set to $protection"
+    
+    exit 0
+}
+
+# Execute main function
+main "$@"
