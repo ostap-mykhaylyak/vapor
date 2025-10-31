@@ -349,7 +349,7 @@ main() {
     set_security_level "$zone_id" "$protection" "$CF_EMAIL" "$CF_KEY"
     
     # Success
-    echo "✓ CloudFlare protection level set to '$protection' for $domain"
+    echo "CloudFlare protection level set to '$protection' for $domain"
     log_event "$user" "INFO" "CloudFlare protection for $domain set to $protection"
     
     exit 0
