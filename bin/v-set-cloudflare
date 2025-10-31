@@ -3,8 +3,6 @@ set -euo pipefail
 IFS=$'\n\t'
 
 ################################################################################
-# Vapor CP - CloudFlare Protection Manager
-# 
 # Sets CloudFlare security protection level for a domain
 # Usage: v-set-cloudflare USER DOMAIN PROTECTION_LEVEL
 # Version: 1.0.0
