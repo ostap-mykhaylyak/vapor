@@ -1,0 +1,619 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+################################################################################
+# Create, modify, or delete system users with Vapor CP structure
+# Usage: v-set-user ACTION USERNAME [OPTIONS]
+# Version: 1.0.0
+################################################################################
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+readonly WWW_GROUP="www-data"
+
+################################################################################
+# Dependencies Check
+################################################################################
+
+check_dependencies() {
+    local deps=("useradd" "usermod" "userdel" "groupadd" "id" "passwd" "chown" "chmod")
+    local missing=()
+    
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+################################################################################
+# Input Validation
+################################################################################
+
+validate_username() {
+    local user="$1"
+    
+    # Username: alphanumeric, underscore, hyphen, 3-32 chars, must start with letter
+    if [[ ! "$user" =~ ^[a-z][a-z0-9_-]{2,31}$ ]]; then
+        echo "Error: Invalid username format." >&2
+        echo "Username must start with lowercase letter, be 3-32 characters," >&2
+        echo "and contain only lowercase letters, numbers, underscore or hyphen." >&2
+        exit 1
+    fi
+    
+    # Check for reserved usernames
+    local reserved=("root" "admin" "administrator" "vapor" "www-data" "mysql" "postgres" "redis" "mail" "postfix")
+    for res in "${reserved[@]}"; do
+        if [[ "$user" == "$res" ]]; then
+            echo "Error: Username '$user' is reserved and cannot be used." >&2
+            exit 1
+        fi
+    done
+}
+
+validate_action() {
+    local action="$1"
+    local valid_actions=("create" "modify" "delete")
+    
+    for valid in "${valid_actions[@]}"; do
+        if [[ "$action" == "$valid" ]]; then
+            return 0
+        fi
+    done
+    
+    echo "Error: Invalid action '$action'." >&2
+    echo "Valid actions: ${valid_actions[*]}" >&2
+    exit 1
+}
+
+validate_email() {
+    local email="$1"
+    local email_regex='^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    
+    if [[ ! "$email" =~ $email_regex ]]; then
+        echo "Error: Invalid email format '$email'." >&2
+        exit 1
+    fi
+}
+
+validate_password() {
+    local password="$1"
+    
+    # Minimum 8 characters
+    if [[ ${#password} -lt 8 ]]; then
+        echo "Error: Password must be at least 8 characters long." >&2
+        exit 1
+    fi
+    
+    # Check for at least one letter and one number
+    if [[ ! "$password" =~ [a-zA-Z] ]] || [[ ! "$password" =~ [0-9] ]]; then
+        echo "Error: Password must contain at least one letter and one number." >&2
+        exit 1
+    fi
+}
+
+################################################################################
+# User Creation
+################################################################################
+
+create_user() {
+    local username="$1"
+    local email="${2:-}"
+    local password="${3:-}"
+    local shell="${4:-/bin/bash}"
+    
+    # Check if user already exists
+    if id "$username" &>/dev/null; then
+        echo "Error: User '$username' already exists." >&2
+        echo "Use 'modify' action to update existing user." >&2
+        exit 1
+    fi
+    
+    # Validate email if provided
+    if [[ -n "$email" ]]; then
+        validate_email "$email"
+    fi
+    
+    # Generate random password if not provided
+    if [[ -z "$password" ]]; then
+        password=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-16)
+        echo "Generated password: $password"
+    else
+        validate_password "$password"
+    fi
+    
+    echo "Creating user '$username'..."
+    
+    # Create user with home directory
+    if ! useradd -m -d "/home/$username" -s "$shell" -c "Vapor CP User" "$username" 2>/dev/null; then
+        echo "Error: Failed to create user '$username'." >&2
+        exit 1
+    fi
+    
+    # Set password
+    if ! echo "$username:$password" | chpasswd 2>/dev/null; then
+        echo "Error: Failed to set password for user '$username'." >&2
+        userdel -r "$username" 2>/dev/null
+        exit 1
+    fi
+    
+    # Add user to www-data group
+    if ! usermod -a -G "$WWW_GROUP" "$username" 2>/dev/null; then
+        echo "Warning: Failed to add user to $WWW_GROUP group." >&2
+    fi
+    
+    # Create directory structure
+    create_user_directories "$username"
+    
+    # Create user configuration file
+    create_user_config "$username" "$email"
+    
+    # Set proper permissions
+    set_user_permissions "$username"
+    
+    # Log event
+    log_event "$username" "INFO" "User created successfully"
+    
+    echo "✓ User '$username' created successfully"
+    echo ""
+    echo "User Details:"
+    echo "  Username: $username"
+    echo "  Home: /home/$username"
+    echo "  Shell: $shell"
+    [[ -n "$email" ]] && echo "  Email: $email"
+    echo "  Groups: $(id -Gn "$username")"
+    echo ""
+    echo "Save this password securely:"
+    echo "  Password: $password"
+}
+
+create_user_directories() {
+    local username="$1"
+    local home_dir="/home/$username"
+    
+    # Directory structure
+    local dirs=(
+        "conf"
+        "tmp"
+        "sessions"
+        "logs"
+        "public_html"
+    )
+    
+    echo "Creating directory structure..."
+    
+    for dir in "${dirs[@]}"; do
+        local full_path="$home_dir/$dir"
+        
+        if ! mkdir -p "$full_path" 2>/dev/null; then
+            echo "Error: Failed to create directory '$full_path'." >&2
+            userdel -r "$username" 2>/dev/null
+            exit 1
+        fi
+    done
+    
+    # Create subdirectories in public_html
+    mkdir -p "$home_dir/public_html/assets" 2>/dev/null || true
+    mkdir -p "$home_dir/public_html/uploads" 2>/dev/null || true
+    
+    # Create default index.html
+    cat > "$home_dir/public_html/index.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to Vapor CP</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .container {
+            text-align: center;
+            color: white;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 3rem;
+            margin: 0 0 1rem 0;
+            font-weight: 700;
+        }
+        p {
+            font-size: 1.2rem;
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌊 Vapor CP</h1>
+        <p>Your site is ready. Start building something amazing!</p>
+    </div>
+</body>
+</html>
+EOF
+    
+    # Create .htaccess for Apache
+    cat > "$home_dir/public_html/.htaccess" << 'EOF'
+# Vapor CP default .htaccess
+Options -Indexes
+DirectoryIndex index.html index.php
+
+# Security headers
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set X-XSS-Protection "1; mode=block"
+</IfModule>
+
+# PHP settings
+<IfModule mod_php.c>
+    php_flag display_errors Off
+    php_flag log_errors On
+</IfModule>
+EOF
+}
+
+create_user_config() {
+    local username="$1"
+    local email="$2"
+    local config_file="/home/$username/conf/user.conf"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    cat > "$config_file" << EOF
+# Vapor CP User Configuration
+# User: $username
+# Created: $timestamp
+
+USER='$username'
+EMAIL='$email'
+CREATED='$timestamp'
+STATUS='active'
+SHELL='/bin/bash'
+
+# Paths
+HOME_DIR='/home/$username'
+PUBLIC_DIR='/home/$username/public_html'
+CONF_DIR='/home/$username/conf'
+LOG_DIR='/home/$username/logs'
+TMP_DIR='/home/$username/tmp'
+SESSION_DIR='/home/$username/sessions'
+
+# Limits
+DISK_QUOTA='unlimited'
+BANDWIDTH_LIMIT='unlimited'
+MAX_DATABASES='unlimited'
+MAX_DOMAINS='unlimited'
+
+# Backup
+BACKUP_ENABLED='yes'
+BACKUP_RETENTION='7'
+EOF
+    
+    chmod 600 "$config_file"
+}
+
+set_user_permissions() {
+    local username="$1"
+    local home_dir="/home/$username"
+    
+    echo "Setting permissions..."
+    
+    # Set ownership
+    chown -R "$username:$username" "$home_dir"
+    
+    # Set home directory permissions
+    chmod 755 "$home_dir"
+    
+    # Set directory permissions
+    chmod 750 "$home_dir/conf"
+    chmod 750 "$home_dir/tmp"
+    chmod 750 "$home_dir/sessions"
+    chmod 755 "$home_dir/logs"
+    chmod 755 "$home_dir/public_html"
+    
+    # Make www-data group have read access to public_html
+    chgrp -R "$WWW_GROUP" "$home_dir/public_html"
+    chmod -R g+rX "$home_dir/public_html"
+    
+    # Secure configuration files
+    find "$home_dir/conf" -type f -exec chmod 600 {} \;
+    
+    # Set proper permissions for session directory
+    chmod 700 "$home_dir/sessions"
+}
+
+################################################################################
+# User Modification
+################################################################################
+
+modify_user() {
+    local username="$1"
+    local email="${2:-}"
+    local password="${3:-}"
+    local shell="${4:-}"
+    
+    # Check if user exists
+    if ! id "$username" &>/dev/null; then
+        echo "Error: User '$username' does not exist." >&2
+        echo "Use 'create' action to create a new user." >&2
+        exit 1
+    fi
+    
+    echo "Modifying user '$username'..."
+    
+    local changes=0
+    
+    # Update email
+    if [[ -n "$email" ]]; then
+        validate_email "$email"
+        local config_file="/home/$username/conf/user.conf"
+        if [[ -f "$config_file" ]]; then
+            sed -i "s/^EMAIL=.*/EMAIL='$email'/" "$config_file"
+            echo "✓ Email updated to: $email"
+            ((changes++))
+        fi
+    fi
+    
+    # Update password
+    if [[ -n "$password" ]]; then
+        validate_password "$password"
+        if echo "$username:$password" | chpasswd 2>/dev/null; then
+            echo "✓ Password updated"
+            ((changes++))
+        else
+            echo "Error: Failed to update password." >&2
+        fi
+    fi
+    
+    # Update shell
+    if [[ -n "$shell" ]]; then
+        if usermod -s "$shell" "$username" 2>/dev/null; then
+            echo "✓ Shell updated to: $shell"
+            ((changes++))
+        else
+            echo "Error: Failed to update shell." >&2
+        fi
+    fi
+    
+    # Ensure user is still in www-data group
+    if ! id -Gn "$username" | grep -q "$WWW_GROUP"; then
+        usermod -a -G "$WWW_GROUP" "$username" 2>/dev/null
+        echo "✓ Re-added to $WWW_GROUP group"
+        ((changes++))
+    fi
+    
+    if [[ $changes -eq 0 ]]; then
+        echo "No changes specified. User remains unchanged."
+        echo "Usage: $SCRIPT_NAME modify USERNAME [EMAIL] [PASSWORD] [SHELL]"
+        exit 0
+    fi
+    
+    log_event "$username" "INFO" "User modified ($changes changes)"
+    echo ""
+    echo "✓ User '$username' modified successfully ($changes changes)"
+}
+
+################################################################################
+# User Deletion
+################################################################################
+
+delete_user() {
+    local username="$1"
+    local keep_home="${2:-no}"
+    
+    # Check if user exists
+    if ! id "$username" &>/dev/null; then
+        echo "Error: User '$username' does not exist." >&2
+        exit 1
+    fi
+    
+    # Prevent deletion of system users
+    local uid=$(id -u "$username")
+    if [[ $uid -lt 1000 ]]; then
+        echo "Error: Cannot delete system user (UID < 1000)." >&2
+        exit 1
+    fi
+    
+    echo "WARNING: You are about to delete user '$username'."
+    
+    if [[ "$keep_home" == "yes" ]]; then
+        echo "Home directory will be KEPT at: /home/$username"
+    else
+        echo "Home directory will be REMOVED: /home/$username"
+    fi
+    
+    echo ""
+    read -p "Are you sure you want to continue? (yes/no): " -r confirmation
+    
+    if [[ "$confirmation" != "yes" ]]; then
+        echo "Operation cancelled."
+        exit 0
+    fi
+    
+    echo "Deleting user '$username'..."
+    
+    # Kill all user processes
+    pkill -u "$username" 2>/dev/null || true
+    sleep 1
+    
+    # Delete user
+    if [[ "$keep_home" == "yes" ]]; then
+        if userdel "$username" 2>/dev/null; then
+            echo "✓ User account deleted (home directory preserved)"
+        else
+            echo "Error: Failed to delete user account." >&2
+            exit 1
+        fi
+    else
+        if userdel -r "$username" 2>/dev/null; then
+            echo "✓ User account and home directory deleted"
+        else
+            echo "Error: Failed to delete user account." >&2
+            exit 1
+        fi
+    fi
+    
+    log_event "$username" "INFO" "User deleted (keep_home=$keep_home)"
+    echo ""
+    echo "✓ User '$username' deleted successfully"
+}
+
+################################################################################
+# Logging
+################################################################################
+
+log_event() {
+    local user="$1"
+    local level="$2"
+    local message="$3"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    local log_dir="/var/log/vapor"
+    local log_file="$log_dir/users.log"
+    
+    if [[ ! -d "$log_dir" ]]; then
+        mkdir -p "$log_dir" 2>/dev/null || true
+    fi
+    
+    if [[ -d "$log_dir" ]]; then
+        echo "[$timestamp] [$level] [user:$user] $message" >> "$log_file" 2>/dev/null || true
+    fi
+}
+
+################################################################################
+# Usage & Help
+################################################################################
+
+show_usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME ACTION USERNAME [OPTIONS]
+
+Manage Vapor CP system users with automatic directory structure creation.
+
+Actions:
+    create             Create a new user
+    modify             Modify existing user
+    delete             Delete a user
+
+Create Options:
+    $SCRIPT_NAME create USERNAME [EMAIL] [PASSWORD] [SHELL]
+    
+    EMAIL              User email address (optional)
+    PASSWORD           User password (auto-generated if not provided)
+    SHELL              User shell (default: /bin/bash)
+
+Modify Options:
+    $SCRIPT_NAME modify USERNAME [EMAIL] [PASSWORD] [SHELL]
+    
+    All options are optional. Only provided values will be updated.
+
+Delete Options:
+    $SCRIPT_NAME delete USERNAME [keep-home]
+    
+    keep-home          If specified, preserves home directory after deletion
+
+Examples:
+    # Create user with auto-generated password
+    $SCRIPT_NAME create john john@example.com
+    
+    # Create user with specific password
+    $SCRIPT_NAME create jane jane@example.com 'SecurePass123'
+    
+    # Modify user email
+    $SCRIPT_NAME modify john newemail@example.com
+    
+    # Change user password
+    $SCRIPT_NAME modify john '' 'NewPassword456'
+    
+    # Delete user and remove home directory
+    $SCRIPT_NAME delete john
+    
+    # Delete user but keep home directory
+    $SCRIPT_NAME delete john keep-home
+
+Directory Structure:
+    /home/USERNAME/
+    ├── conf/          Configuration files (mode 750)
+    ├── tmp/           Temporary files (mode 750)
+    ├── sessions/      Session data (mode 700)
+    ├── logs/          Log files (mode 755)
+    └── public_html/   Web root (mode 755, group: www-data)
+
+Version: $VERSION
+EOF
+}
+
+################################################################################
+# Main Execution
+################################################################################
+
+main() {
+    # Show help
+    if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+    
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script must be run as root." >&2
+        exit 1
+    fi
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Ensure www-data group exists
+    if ! getent group "$WWW_GROUP" &>/dev/null; then
+        echo "Error: Group '$WWW_GROUP' does not exist." >&2
+        echo "Please ensure your web server is properly installed." >&2
+        exit 1
+    fi
+    
+    # Parse action
+    local action="${1,,}"
+    validate_action "$action"
+    shift
+    
+    # Check if username provided
+    if [[ $# -eq 0 ]]; then
+        echo "Error: USERNAME is required." >&2
+        echo "Run '$SCRIPT_NAME --help' for usage information." >&2
+        exit 1
+    fi
+    
+    local username="$1"
+    validate_username "$username"
+    shift
+    
+    # Execute action
+    case "$action" in
+        create)
+            create_user "$username" "${1:-}" "${2:-}" "${3:-}"
+            ;;
+        modify)
+            modify_user "$username" "${1:-}" "${2:-}" "${3:-}"
+            ;;
+        delete)
+            delete_user "$username" "${1:-no}"
+            ;;
+    esac
+    
+    exit 0
+}
+
+# Execute main function
+main "$@"
