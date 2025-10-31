@@ -1,0 +1,3 @@
+#!/bin/bash
+# v-set-cloudflare - Set CloudFlare protection level for a domain
+# Usage: v-set-cloudflare PROTECTION_LEVEL
