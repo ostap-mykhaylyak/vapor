@@ -1,5 +1,6 @@
 [wordpress-scan]
 enabled = true
+port = http,https
 filter = wordpress-scan
 logpath = /var/log/nginx/*access.log
 maxretry = 20
