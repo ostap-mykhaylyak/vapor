@@ -1,0 +1,348 @@
+#!/bin/bash
+
+#########################################################
+# Script per creare una Jail Shell (chroot jail)
+# Isola un utente all'interno della sua home directory
+# L'utente vede solo i suoi file, nessuna struttura jail
+#########################################################
+
+# Verifica che lo script sia eseguito come root
+if [[ $EUID -ne 0 ]]; then
+   echo "Questo script deve essere eseguito come root" 
+   exit 1
+fi
+
+# Directory base per le jail (fuori dalle home degli utenti)
+JAIL_BASE="/var/chroot"
+
+# Funzione per mostrare l'uso
+show_usage() {
+    echo "Uso: $0 [opzioni] <username>"
+    echo ""
+    echo "Opzioni:"
+    echo "  -c, --create      Crea la jail per l'utente"
+    echo "  -r, --remove      Rimuove la jail per l'utente"
+    echo "  -h, --help        Mostra questo messaggio"
+    echo ""
+    echo "Esempio:"
+    echo "  $0 --create john"
+    echo "  $0 --remove john"
+    exit 1
+}
+
+# Funzione per copiare le librerie necessarie
+copy_dependencies() {
+    local binary=$1
+    local jail_dir=$2
+    
+    # Copia il binario
+    cp "$binary" "${jail_dir}${binary}" 2>/dev/null || true
+    
+    # Trova e copia tutte le librerie necessarie
+    ldd "$binary" 2>/dev/null | grep "=>" | awk '{print $3}' | while read lib; do
+        if [[ -f "$lib" ]]; then
+            lib_dir=$(dirname "$lib")
+            mkdir -p "${jail_dir}${lib_dir}"
+            cp "$lib" "${jail_dir}${lib}" 2>/dev/null || true
+        fi
+    done
+    
+    # Copia anche il linker dinamico
+    ldd "$binary" 2>/dev/null | grep -oP '/lib[^[:space:]]*ld[^[:space:]]*' | while read linker; do
+        if [[ -f "$linker" ]]; then
+            linker_dir=$(dirname "$linker")
+            mkdir -p "${jail_dir}${linker_dir}"
+            cp "$linker" "${jail_dir}${linker}" 2>/dev/null || true
+        fi
+    done
+}
+
+# Funzione per creare la jail
+create_jail() {
+    local username=$1
+    
+    # Verifica che l'utente esista
+    if ! id "$username" &>/dev/null; then
+        echo "Errore: L'utente $username non esiste"
+        exit 1
+    fi
+    
+    local user_home=$(eval echo ~$username)
+    local jail_dir="${JAIL_BASE}/${username}"
+    
+    echo "Creazione jail per l'utente: $username"
+    echo "Directory jail: $jail_dir"
+    echo "Home utente (bind mount): $user_home"
+    
+    # Crea la struttura di directory per la jail
+    echo "Creazione struttura directory..."
+    mkdir -p "$jail_dir"
+    mkdir -p "$jail_dir"/{bin,lib,lib64,usr/bin,usr/lib,usr/lib64,dev,etc,tmp,var/tmp}
+    mkdir -p "$jail_dir/home"
+    
+    # Imposta i permessi corretti
+    chown root:root "$jail_dir"
+    chmod 755 "$jail_dir"
+    
+    # Crea i device necessari
+    echo "Creazione device necessari..."
+    [ -e "$jail_dir/dev/null" ] || mknod -m 666 "$jail_dir/dev/null" c 1 3
+    [ -e "$jail_dir/dev/zero" ] || mknod -m 666 "$jail_dir/dev/zero" c 1 5
+    [ -e "$jail_dir/dev/random" ] || mknod -m 444 "$jail_dir/dev/random" c 1 8
+    [ -e "$jail_dir/dev/urandom" ] || mknod -m 444 "$jail_dir/dev/urandom" c 1 9
+    [ -e "$jail_dir/dev/tty" ] || mknod -m 666 "$jail_dir/dev/tty" c 5 0
+    
+    # Lista dei binari essenziali da includere nella jail
+    local binaries=(
+        /bin/bash
+        /bin/ls
+        /bin/cat
+        /bin/cp
+        /bin/mv
+        /bin/rm
+        /bin/mkdir
+        /bin/rmdir
+        /bin/pwd
+        /bin/grep
+        /bin/chmod
+        /bin/touch
+        /bin/date
+        /bin/echo
+        /bin/sed
+        /bin/awk
+        /usr/bin/nano
+        /usr/bin/vim
+        /usr/bin/vi
+        /usr/bin/less
+        /usr/bin/more
+        /usr/bin/tail
+        /usr/bin/head
+        /usr/bin/wc
+        /usr/bin/find
+        /usr/bin/ssh
+        /usr/bin/scp
+        /usr/bin/sftp
+        /usr/bin/wget
+        /usr/bin/curl
+        /usr/bin/tar
+        /usr/bin/gzip
+        /usr/bin/gunzip
+        /usr/bin/zip
+        /usr/bin/unzip
+        /usr/bin/git
+        /usr/bin/rsync
+        /usr/bin/diff
+        /usr/bin/which
+        /usr/bin/whoami
+        /usr/bin/id
+    )
+    
+    echo "Copiando binari e dipendenze..."
+    for binary in "${binaries[@]}"; do
+        if [[ -f "$binary" ]]; then
+            binary_dir=$(dirname "$binary")
+            mkdir -p "${jail_dir}${binary_dir}"
+            copy_dependencies "$binary" "$jail_dir" 2>/dev/null
+        fi
+    done
+    
+    # Copia file di configurazione essenziali
+    echo "Copiando file di configurazione..."
+    
+    # Crea /etc/passwd con solo l'utente specifico
+    grep "^${username}:" /etc/passwd > "$jail_dir/etc/passwd"
+    echo "root:x:0:0:root:/root:/bin/bash" >> "$jail_dir/etc/passwd"
+    
+    # Crea /etc/group
+    grep "^$(id -gn $username):" /etc/group > "$jail_dir/etc/group"
+    echo "root:x:0:" >> "$jail_dir/etc/group"
+    
+    # Copia altri file essenziali
+    cp /etc/hosts "$jail_dir/etc/" 2>/dev/null || true
+    cp /etc/resolv.conf "$jail_dir/etc/" 2>/dev/null || true
+    cp /etc/nsswitch.conf "$jail_dir/etc/" 2>/dev/null || true
+    cp /etc/hostname "$jail_dir/etc/" 2>/dev/null || true
+    
+    # Crea file terminfo per editor
+    if [ -d /lib/terminfo ]; then
+        mkdir -p "$jail_dir/lib/terminfo"
+        cp -r /lib/terminfo/* "$jail_dir/lib/terminfo/" 2>/dev/null || true
+    fi
+    if [ -d /usr/share/terminfo ]; then
+        mkdir -p "$jail_dir/usr/share/terminfo"
+        cp -r /usr/share/terminfo/* "$jail_dir/usr/share/terminfo/" 2>/dev/null || true
+    fi
+    
+    # Imposta i permessi su tmp
+    chmod 1777 "$jail_dir/tmp"
+    chmod 1777 "$jail_dir/var/tmp"
+    
+    # Crea il punto di mount per la home dell'utente
+    mkdir -p "$jail_dir$user_home"
+    
+    # Modifica la shell dell'utente per usare la jail
+    echo "Configurazione shell jailed..."
+    
+    # Crea uno script wrapper per la shell jailed
+    cat > "/usr/local/bin/jail_shell_${username}" << EOF
+#!/bin/bash
+
+# Directory della jail e home dell'utente
+JAIL_DIR="$jail_dir"
+USER_HOME="$user_home"
+
+# Monta la home dell'utente nella jail se non è già montata
+if ! mountpoint -q "\${JAIL_DIR}\${USER_HOME}"; then
+    mount --bind "\${USER_HOME}" "\${JAIL_DIR}\${USER_HOME}"
+fi
+
+# Avvia la shell in chroot
+exec /usr/sbin/chroot "\${JAIL_DIR}" /bin/bash -c "cd \${USER_HOME} && exec /bin/bash --login"
+EOF
+    
+    chmod 755 "/usr/local/bin/jail_shell_${username}"
+    
+    # Salva la shell originale dell'utente
+    original_shell=$(getent passwd "$username" | cut -d: -f7)
+    echo "$original_shell" > "/var/chroot/.${username}_original_shell"
+    
+    # Modifica la shell dell'utente
+    usermod -s "/usr/local/bin/jail_shell_${username}" "$username"
+    
+    # Crea file di configurazione bash nella home reale dell'utente (se non esistono)
+    if [ ! -f "$user_home/.bashrc" ]; then
+        cat > "$user_home/.bashrc" << 'EOF'
+# .bashrc
+PS1='\u@\h:\w\$ '
+export PATH=/bin:/usr/bin:/usr/local/bin
+alias ll='ls -lah'
+alias la='ls -A'
+alias l='ls -CF'
+EOF
+        chown $username:$(id -gn $username) "$user_home/.bashrc"
+    fi
+    
+    if [ ! -f "$user_home/.bash_profile" ]; then
+        cat > "$user_home/.bash_profile" << 'EOF'
+# .bash_profile
+if [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+EOF
+        chown $username:$(id -gn $username) "$user_home/.bash_profile"
+    fi
+    
+    # Crea un entry in /etc/fstab per il mount automatico (opzionale)
+    if ! grep -q "$jail_dir$user_home" /etc/fstab 2>/dev/null; then
+        echo "# Jail bind mount per $username" >> /etc/fstab
+        echo "$user_home $jail_dir$user_home none bind 0 0" >> /etc/fstab
+    fi
+    
+    # Monta subito la home
+    mount --bind "$user_home" "$jail_dir$user_home"
+    
+    echo ""
+    echo "✓ Jail creata con successo per l'utente $username"
+    echo "  Jail chroot: $jail_dir"
+    echo "  Home utente: $user_home (bind mounted)"
+    echo "  L'utente vede solo i suoi file nella home, completamente trasparente"
+    echo ""
+    echo "NOTA: La home dell'utente è montata con bind mount."
+    echo "      L'utente non vede alcuna struttura di jail, solo i suoi file."
+}
+
+# Funzione per rimuovere la jail
+remove_jail() {
+    local username=$1
+    
+    # Verifica che l'utente esista
+    if ! id "$username" &>/dev/null; then
+        echo "Errore: L'utente $username non esiste"
+        exit 1
+    fi
+    
+    local user_home=$(eval echo ~$username)
+    local jail_dir="${JAIL_BASE}/${username}"
+    
+    echo "Rimozione jail per l'utente: $username"
+    
+    # Smonta la home se montata
+    if mountpoint -q "$jail_dir$user_home" 2>/dev/null; then
+        echo "Smontaggio home utente..."
+        umount "$jail_dir$user_home"
+    fi
+    
+    # Ripristina la shell originale
+    if [ -f "/var/chroot/.${username}_original_shell" ]; then
+        original_shell=$(cat "/var/chroot/.${username}_original_shell")
+        usermod -s "$original_shell" "$username"
+        rm "/var/chroot/.${username}_original_shell"
+    else
+        usermod -s /bin/bash "$username"
+    fi
+    
+    # Rimuove lo script wrapper
+    rm -f "/usr/local/bin/jail_shell_${username}"
+    
+    # Rimuove entry da fstab
+    if grep -q "$jail_dir$user_home" /etc/fstab 2>/dev/null; then
+        sed -i "\|$jail_dir$user_home|d" /etc/fstab
+        sed -i "/# Jail bind mount per $username/d" /etc/fstab
+    fi
+    
+    # Chiede conferma prima di rimuovere la directory jail
+    echo ""
+    read -p "Vuoi rimuovere la directory jail ($jail_dir)? [s/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[SsYy]$ ]]; then
+        echo "Rimozione directory jail..."
+        rm -rf "$jail_dir"
+        echo "✓ Directory jail rimossa"
+    else
+        echo "Directory jail mantenuta in: $jail_dir"
+    fi
+    
+    echo "✓ Jail rimossa per l'utente $username"
+    echo "  I file dell'utente sono rimasti intatti in: $user_home"
+}
+
+# Parsing degli argomenti
+ACTION=""
+USERNAME=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -c|--create)
+            ACTION="create"
+            shift
+            ;;
+        -r|--remove)
+            ACTION="remove"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        *)
+            USERNAME=$1
+            shift
+            ;;
+    esac
+done
+
+# Verifica che sia stata specificata un'azione e un username
+if [[ -z "$ACTION" ]] || [[ -z "$USERNAME" ]]; then
+    show_usage
+fi
+
+# Esegui l'azione richiesta
+case $ACTION in
+    create)
+        create_jail "$USERNAME"
+        ;;
+    remove)
+        remove_jail "$USERNAME"
+        ;;
+esac
+
+exit 0
