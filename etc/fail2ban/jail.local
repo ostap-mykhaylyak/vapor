@@ -1,0 +1,7 @@
+[wordpress-scan]
+enabled = true
+filter = wordpress-scan
+logpath = /var/log/nginx/*access.log
+maxretry = 20
+bantime = 86400
+findtime = 600
