@@ -6,4 +6,4 @@ maxretry = 20
 bantime = 86400
 findtime = 600
 action = iptables-multiport[name=%(name)s, port="http,https"]
-         curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer TUA-API-KEY" --data '{"ip":"<ip>","jail":"<name>","comment":"WordPress plugin scanner - automated vulnerability scanning detected","severity":"high","category":"scanner","failures":<failures>,"timestamp":"<time>","source":"'$(hostname)'","banned_at":"'$(date)'"}'  https://api.tuoservizio.com/blacklist/report
+         curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $(curl -s ifconfig.me)" --data '{"ip":"<ip>","jail":"<name>","comment":"WordPress plugin/theme scanner - automated vulnerability scanning","severity":"high","category":"scanner","failures":<failures>,"timestamp":"<time>","source_ip":"'$(curl -s ifconfig.me)'"}' %(blacklist_url)s
