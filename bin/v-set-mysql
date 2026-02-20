@@ -1,0 +1,754 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+################################################################################
+# Create, modify, or delete MySQL 8+ users and databases for Vapor CP
+# Usage: v-set-mysql ACTION USERNAME [OPTIONS]
+# Version: 1.0.0
+################################################################################
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+readonly MYSQL_LOG_DIR="/var/log/vapor"
+readonly MYSQL_LOG_FILE="$MYSQL_LOG_DIR/mysql.log"
+readonly VAPOR_CONF_BASE="/home"
+
+################################################################################
+# Helpers
+################################################################################
+
+log_event() {
+    local user="$1" level="$2" message="$3"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    mkdir -p "$MYSQL_LOG_DIR" 2>/dev/null || true
+    echo "[$ts] [$level] [mysql:$user] $message" >> "$MYSQL_LOG_FILE" 2>/dev/null || true
+}
+
+mysql_exec() {
+    mysql --defaults-extra-file=<(printf '[client]\nuser=root\npassword=%s\n' "$MYSQL_ROOT_PASSWORD") \
+          --silent --skip-column-names -e "$1" 2>/dev/null
+}
+
+mysql_exec_verbose() {
+    mysql --defaults-extra-file=<(printf '[client]\nuser=root\npassword=%s\n' "$MYSQL_ROOT_PASSWORD") \
+          -e "$1" 2>&1
+}
+
+print_separator() {
+    echo "────────────────────────────────────────────────────"
+}
+
+################################################################################
+# Dependencies & Root Check
+################################################################################
+
+check_dependencies() {
+    local deps=("mysql" "mysqladmin" "openssl" "awk" "sed")
+    local missing=()
+    for cmd in "${deps[@]}"; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script must be run as root." >&2
+        exit 1
+    fi
+}
+
+################################################################################
+# MySQL Root Auth
+################################################################################
+
+get_mysql_root_password() {
+    # 1) Try env variable
+    if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
+        return
+    fi
+
+    # 2) Try /root/.my.cnf
+    if [[ -f /root/.my.cnf ]]; then
+        local pw
+        pw=$(awk -F'=' '/^password/{gsub(/[[:space:]"'"'"']/, "", $2); print $2; exit}' /root/.my.cnf)
+        if [[ -n "$pw" ]]; then
+            export MYSQL_ROOT_PASSWORD="$pw"
+            return
+        fi
+    fi
+
+    # 3) Try /etc/vapor/mysql.conf
+    if [[ -f /etc/vapor/mysql.conf ]]; then
+        # shellcheck source=/dev/null
+        source /etc/vapor/mysql.conf
+        if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
+            return
+        fi
+    fi
+
+    # 4) Interactive prompt
+    echo -n "Enter MySQL root password: "
+    read -rs MYSQL_ROOT_PASSWORD
+    echo ""
+    export MYSQL_ROOT_PASSWORD
+}
+
+check_mysql_connection() {
+    if ! mysqladmin --defaults-extra-file=<(printf '[client]\nuser=root\npassword=%s\n' "$MYSQL_ROOT_PASSWORD") \
+         ping --silent 2>/dev/null; then
+        echo "Error: Cannot connect to MySQL. Check your root credentials." >&2
+        exit 1
+    fi
+
+    local version
+    version=$(mysql_exec "SELECT VERSION();")
+    local major
+    major=$(echo "$version" | cut -d'.' -f1)
+
+    if [[ "$major" -lt 8 ]]; then
+        echo "Error: MySQL 8.0+ is required. Detected version: $version" >&2
+        exit 1
+    fi
+
+    echo "✓ Connected to MySQL $version"
+}
+
+################################################################################
+# Input Validation
+################################################################################
+
+validate_action() {
+    local action="$1"
+    local valid=("create" "modify" "delete" "list" "info")
+    for v in "${valid[@]}"; do
+        [[ "$action" == "$v" ]] && return 0
+    done
+    echo "Error: Invalid action '$action'. Valid: ${valid[*]}" >&2
+    exit 1
+}
+
+validate_username() {
+    local user="$1"
+    # MySQL usernames: max 32 chars, we restrict to safe subset
+    if [[ ! "$user" =~ ^[a-z][a-z0-9_]{1,30}$ ]]; then
+        echo "Error: Invalid username '$user'." >&2
+        echo "Must start with lowercase letter, 2-31 chars, only [a-z0-9_]." >&2
+        exit 1
+    fi
+    local reserved=("root" "mysql" "admin" "vapor" "sys" "information_schema" "performance_schema")
+    for r in "${reserved[@]}"; do
+        if [[ "$user" == "$r" ]]; then
+            echo "Error: Username '$user' is reserved." >&2
+            exit 1
+        fi
+    done
+}
+
+validate_dbname() {
+    local db="$1"
+    if [[ ! "$db" =~ ^[a-zA-Z0-9_]{1,64}$ ]]; then
+        echo "Error: Invalid database name '$db'. Only [a-zA-Z0-9_], max 64 chars." >&2
+        exit 1
+    fi
+    local reserved=("mysql" "sys" "information_schema" "performance_schema")
+    for r in "${reserved[@]}"; do
+        if [[ "${db,,}" == "$r" ]]; then
+            echo "Error: Database name '$db' is reserved." >&2
+            exit 1
+        fi
+    done
+}
+
+validate_password() {
+    local pw="$1"
+    if [[ ${#pw} -lt 10 ]]; then
+        echo "Error: Password must be at least 10 characters." >&2
+        exit 1
+    fi
+    if [[ ! "$pw" =~ [a-zA-Z] ]] || [[ ! "$pw" =~ [0-9] ]]; then
+        echo "Error: Password must contain at least one letter and one number." >&2
+        exit 1
+    fi
+}
+
+validate_host() {
+    local host="$1"
+    # Allow: localhost, %, IP, hostname
+    if [[ ! "$host" =~ ^(%|localhost|[a-zA-Z0-9._-]+|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})$ ]]; then
+        echo "Error: Invalid host '$host'." >&2
+        exit 1
+    fi
+}
+
+generate_password() {
+    openssl rand -base64 20 | tr -dc 'a-zA-Z0-9!@#$%^&*' | cut -c1-20
+}
+
+################################################################################
+# Vapor CP Config helpers
+################################################################################
+
+vapor_conf_dir() {
+    echo "$VAPOR_CONF_BASE/$1/conf"
+}
+
+save_db_config() {
+    local username="$1" dbname="$2" host="$3" password="$4"
+    local conf_dir
+    conf_dir=$(vapor_conf_dir "$username")
+    local conf_file="$conf_dir/mysql_${dbname}.conf"
+
+    if [[ -d "$conf_dir" ]]; then
+        cat > "$conf_file" << EOF
+# Vapor CP MySQL Configuration
+# Database: $dbname
+# Created: $(date '+%Y-%m-%d %H:%M:%S')
+
+DB_NAME='$dbname'
+DB_USER='$username'
+DB_HOST='$host'
+DB_PASS='$password'
+DB_CHARSET='utf8mb4'
+DB_COLLATION='utf8mb4_unicode_ci'
+EOF
+        chmod 600 "$conf_file"
+        chown "$username":"$username" "$conf_file" 2>/dev/null || true
+        echo "✓ Config saved: $conf_file"
+    fi
+}
+
+remove_db_config() {
+    local username="$1" dbname="$2"
+    local conf_file
+    conf_file="$(vapor_conf_dir "$username")/mysql_${dbname}.conf"
+    [[ -f "$conf_file" ]] && rm -f "$conf_file" && echo "✓ Config removed: $conf_file"
+}
+
+################################################################################
+# CREATE
+################################################################################
+
+create_user() {
+    local username="$1"
+    local host="${2:-localhost}"
+    local password="${3:-}"
+    local dbname="${4:-}"
+    local role="${5:-standard}"    # standard | readonly | admin
+
+    validate_host "$host"
+
+    # Generate password if not given
+    local generated=false
+    if [[ -z "$password" ]]; then
+        password=$(generate_password)
+        generated=true
+    else
+        validate_password "$password"
+    fi
+
+    # Check if user@host already exists
+    local exists
+    exists=$(mysql_exec "SELECT COUNT(*) FROM mysql.user WHERE User='$username' AND Host='$host';")
+    if [[ "$exists" -gt 0 ]]; then
+        echo "Error: MySQL user '$username'@'$host' already exists." >&2
+        echo "Use 'modify' action to update." >&2
+        exit 1
+    fi
+
+    echo "Creating MySQL user '$username'@'$host'..."
+
+    # MySQL 8 uses caching_sha2_password by default
+    mysql_exec "CREATE USER '$username'@'$host' IDENTIFIED WITH caching_sha2_password BY '$password';"
+    echo "✓ User '$username'@'$host' created (auth: caching_sha2_password)"
+
+    # Optional: create a default database
+    if [[ -n "$dbname" ]]; then
+        validate_dbname "$dbname"
+        create_database_for_user "$username" "$host" "$dbname" "$role"
+        save_db_config "$username" "$dbname" "$host" "$password"
+    fi
+
+    # Apply global role grants if no specific db
+    if [[ -z "$dbname" ]]; then
+        apply_role_grants "$username" "$host" "*" "*" "$role"
+    fi
+
+    mysql_exec "FLUSH PRIVILEGES;"
+
+    log_event "$username" "INFO" "User created at host=$host role=$role db=${dbname:-none}"
+
+    print_separator
+    echo "✓ MySQL user '$username' created successfully"
+    echo ""
+    echo "  User     : $username"
+    echo "  Host     : $host"
+    echo "  Auth     : caching_sha2_password"
+    echo "  Role     : $role"
+    [[ -n "$dbname" ]] && echo "  Database : $dbname"
+    if $generated; then
+        echo ""
+        echo "  ⚠ Save this password — it won't be shown again:"
+        echo "  Password : $password"
+    fi
+    print_separator
+}
+
+create_database_for_user() {
+    local username="$1" host="$2" dbname="$3" role="${4:-standard}"
+
+    # Check if DB exists
+    local db_exists
+    db_exists=$(mysql_exec "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$dbname';")
+    if [[ "$db_exists" -gt 0 ]]; then
+        echo "Warning: Database '$dbname' already exists. Skipping creation." >&2
+    else
+        mysql_exec "CREATE DATABASE \`$dbname\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        echo "✓ Database '$dbname' created (charset: utf8mb4, collation: utf8mb4_unicode_ci)"
+    fi
+
+    apply_role_grants "$username" "$host" "$dbname" "*" "$role"
+}
+
+apply_role_grants() {
+    local username="$1" host="$2" db="$3" tbl="$4" role="$5"
+    local target="\`$db\`.\`$tbl\`"
+    [[ "$db" == "*" ]] && target="*.*"
+
+    case "$role" in
+        standard)
+            mysql_exec "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER,
+                         CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, CREATE VIEW,
+                         SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EVENT, TRIGGER
+                         ON $target TO '$username'@'$host';"
+            ;;
+        readonly)
+            mysql_exec "GRANT SELECT ON $target TO '$username'@'$host';"
+            ;;
+        admin)
+            mysql_exec "GRANT ALL PRIVILEGES ON $target TO '$username'@'$host';"
+            ;;
+        *)
+            echo "Error: Unknown role '$role'. Use: standard | readonly | admin" >&2
+            exit 1
+            ;;
+    esac
+    echo "✓ Grants applied (role: $role) on $target"
+}
+
+################################################################################
+# ADD DATABASE to existing user
+################################################################################
+
+add_database() {
+    local username="$1"
+    local dbname="$2"
+    local host="${3:-localhost}"
+    local role="${4:-standard}"
+
+    validate_dbname "$dbname"
+    validate_host "$host"
+
+    # Check user exists
+    local exists
+    exists=$(mysql_exec "SELECT COUNT(*) FROM mysql.user WHERE User='$username' AND Host='$host';")
+    if [[ "$exists" -eq 0 ]]; then
+        echo "Error: MySQL user '$username'@'$host' does not exist." >&2
+        exit 1
+    fi
+
+    create_database_for_user "$username" "$host" "$dbname" "$role"
+    mysql_exec "FLUSH PRIVILEGES;"
+
+    log_event "$username" "INFO" "Database added: $dbname host=$host role=$role"
+    echo "✓ Database '$dbname' added and granted to '$username'@'$host'"
+}
+
+################################################################################
+# MODIFY
+################################################################################
+
+modify_user() {
+    local username="$1"
+    local host="${2:-localhost}"
+
+    validate_host "$host"
+
+    local exists
+    exists=$(mysql_exec "SELECT COUNT(*) FROM mysql.user WHERE User='$username' AND Host='$host';")
+    if [[ "$exists" -eq 0 ]]; then
+        echo "Error: MySQL user '$username'@'$host' does not exist." >&2
+        exit 1
+    fi
+
+    echo "Modifying MySQL user '$username'@'$host'..."
+    echo "What would you like to modify?"
+    echo "  1) Change password"
+    echo "  2) Change authentication plugin"
+    echo "  3) Change host"
+    echo "  4) Add a new database"
+    echo "  5) Revoke all privileges on a database"
+    echo "  6) Lock / Unlock account"
+    echo -n "Choice [1-6]: "
+    read -r choice
+
+    case "$choice" in
+        1) _modify_password "$username" "$host" ;;
+        2) _modify_auth_plugin "$username" "$host" ;;
+        3) _modify_host "$username" "$host" ;;
+        4)
+            echo -n "New database name: "; read -r newdb
+            echo -n "Role [standard/readonly/admin]: "; read -r newrole
+            add_database "$username" "$newdb" "$host" "${newrole:-standard}"
+            ;;
+        5) _revoke_database "$username" "$host" ;;
+        6) _toggle_lock "$username" "$host" ;;
+        *) echo "Invalid choice."; exit 1 ;;
+    esac
+
+    mysql_exec "FLUSH PRIVILEGES;"
+    log_event "$username" "INFO" "User modified (choice=$choice)"
+}
+
+_modify_password() {
+    local username="$1" host="$2"
+    echo -n "New password (leave empty to auto-generate): "
+    read -rs newpw; echo ""
+
+    if [[ -z "$newpw" ]]; then
+        newpw=$(generate_password)
+        echo "Generated password: $newpw"
+    else
+        validate_password "$newpw"
+    fi
+
+    mysql_exec "ALTER USER '$username'@'$host' IDENTIFIED BY '$newpw';"
+    echo "✓ Password updated for '$username'@'$host'"
+}
+
+_modify_auth_plugin() {
+    local username="$1" host="$2"
+    echo "Available plugins:"
+    echo "  1) caching_sha2_password  (MySQL 8 default, most secure)"
+    echo "  2) mysql_native_password  (legacy, wider compatibility)"
+    echo -n "Choice [1/2]: "; read -r pchoice
+
+    local plugin
+    case "$pchoice" in
+        1) plugin="caching_sha2_password" ;;
+        2) plugin="mysql_native_password" ;;
+        *) echo "Invalid choice."; exit 1 ;;
+    esac
+
+    echo -n "New password: "; read -rs newpw; echo ""
+    validate_password "$newpw"
+    mysql_exec "ALTER USER '$username'@'$host' IDENTIFIED WITH $plugin BY '$newpw';"
+    echo "✓ Auth plugin changed to '$plugin'"
+}
+
+_modify_host() {
+    local username="$1" old_host="$2"
+    echo -n "New host (e.g. %, 192.168.1.%): "; read -r new_host
+    validate_host "$new_host"
+
+    # MySQL 8: RENAME USER
+    mysql_exec "RENAME USER '$username'@'$old_host' TO '$username'@'$new_host';"
+    echo "✓ Host changed: '$old_host' → '$new_host'"
+}
+
+_revoke_database() {
+    local username="$1" host="$2"
+    echo "Databases accessible by '$username'@'$host':"
+    mysql_exec "SELECT DISTINCT TABLE_SCHEMA FROM information_schema.SCHEMA_PRIVILEGES
+                WHERE GRANTEE = \"'$username'@'$host'\";" | column -t
+    echo -n "Database to revoke: "; read -r rdb
+    validate_dbname "$rdb"
+    mysql_exec "REVOKE ALL PRIVILEGES ON \`$rdb\`.* FROM '$username'@'$host';"
+    echo "✓ All privileges revoked on '$rdb' from '$username'@'$host'"
+}
+
+_toggle_lock() {
+    local username="$1" host="$2"
+    local status
+    status=$(mysql_exec "SELECT account_locked FROM mysql.user WHERE User='$username' AND Host='$host';")
+    if [[ "$status" == "Y" ]]; then
+        mysql_exec "ALTER USER '$username'@'$host' ACCOUNT UNLOCK;"
+        echo "✓ Account '$username'@'$host' UNLOCKED"
+    else
+        mysql_exec "ALTER USER '$username'@'$host' ACCOUNT LOCK;"
+        echo "✓ Account '$username'@'$host' LOCKED"
+    fi
+}
+
+################################################################################
+# DELETE
+################################################################################
+
+delete_user() {
+    local username="$1"
+    local host="${2:-localhost}"
+    local drop_dbs="${3:-no}"
+
+    validate_host "$host"
+
+    local exists
+    exists=$(mysql_exec "SELECT COUNT(*) FROM mysql.user WHERE User='$username' AND Host='$host';")
+    if [[ "$exists" -eq 0 ]]; then
+        echo "Error: MySQL user '$username'@'$host' does not exist." >&2
+        exit 1
+    fi
+
+    echo "WARNING: You are about to delete MySQL user '$username'@'$host'."
+
+    # List databases owned/accessible
+    local dbs
+    dbs=$(mysql_exec "SELECT DISTINCT TABLE_SCHEMA FROM information_schema.SCHEMA_PRIVILEGES
+                      WHERE GRANTEE = \"'$username'@'$host'\";" 2>/dev/null || true)
+
+    if [[ -n "$dbs" ]]; then
+        echo ""
+        echo "Databases accessible by this user:"
+        echo "$dbs" | sed 's/^/  - /'
+        echo ""
+        if [[ "$drop_dbs" == "drop-databases" ]]; then
+            echo "  ⚠ These databases will also be DROPPED."
+        else
+            echo "  Databases will NOT be dropped (pass 'drop-databases' to drop them)."
+        fi
+    fi
+
+    echo ""
+    read -p "Are you sure you want to continue? (yes/no): " -r confirm
+    [[ "$confirm" != "yes" ]] && echo "Operation cancelled." && exit 0
+
+    # Drop databases if requested
+    if [[ "$drop_dbs" == "drop-databases" ]] && [[ -n "$dbs" ]]; then
+        while IFS= read -r db; do
+            [[ -z "$db" ]] && continue
+            mysql_exec "DROP DATABASE IF EXISTS \`$db\`;"
+            echo "✓ Database '$db' dropped"
+            remove_db_config "$username" "$db"
+        done <<< "$dbs"
+    fi
+
+    mysql_exec "DROP USER '$username'@'$host';"
+    mysql_exec "FLUSH PRIVILEGES;"
+
+    log_event "$username" "INFO" "User deleted host=$host drop_dbs=$drop_dbs"
+    echo ""
+    echo "✓ MySQL user '$username'@'$host' deleted successfully"
+}
+
+################################################################################
+# LIST
+################################################################################
+
+list_users() {
+    local filter="${1:-}"
+    echo ""
+    echo "MySQL Users:"
+    print_separator
+
+    local query="SELECT
+        u.User,
+        u.Host,
+        u.plugin AS auth_plugin,
+        IF(u.account_locked='Y','🔒 locked','✓ active') AS status,
+        IF(u.password_expired='Y','⚠ expired','ok') AS password
+    FROM mysql.user u
+    WHERE u.User != ''
+      AND u.User NOT IN ('mysql.infoschema','mysql.session','mysql.sys')"
+
+    if [[ -n "$filter" ]]; then
+        query+=" AND u.User LIKE '%$filter%'"
+    fi
+
+    query+=" ORDER BY u.User, u.Host;"
+
+    mysql_exec_verbose "$query" | column -t
+    echo ""
+}
+
+################################################################################
+# INFO
+################################################################################
+
+info_user() {
+    local username="$1"
+    local host="${2:-}"
+
+    local where="User='$username'"
+    [[ -n "$host" ]] && where+=" AND Host='$host'"
+
+    local exists
+    exists=$(mysql_exec "SELECT COUNT(*) FROM mysql.user WHERE $where;")
+    if [[ "$exists" -eq 0 ]]; then
+        echo "Error: MySQL user '$username' not found." >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "User Info: $username"
+    print_separator
+
+    # Account details
+    mysql_exec_verbose "SELECT User, Host, plugin AS auth_plugin,
+        account_locked, password_expired, password_last_changed,
+        Create_priv, Drop_priv, Grant_option, Super_priv
+        FROM mysql.user WHERE $where;" | column -t
+
+    echo ""
+    echo "Databases accessible:"
+    print_separator
+    mysql_exec_verbose "SELECT TABLE_SCHEMA AS 'Database',
+        GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE SEPARATOR ', ') AS 'Privileges'
+        FROM information_schema.SCHEMA_PRIVILEGES
+        WHERE GRANTEE LIKE \"'$username'@%\"
+        GROUP BY TABLE_SCHEMA;" | column -t
+
+    echo ""
+    echo "Global privileges:"
+    print_separator
+    mysql_exec_verbose "SHOW GRANTS FOR '$username'@'${host:-localhost}';" 2>/dev/null || \
+        echo "  (run with specific host for grant details)"
+    echo ""
+}
+
+################################################################################
+# Usage
+################################################################################
+
+show_usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME ACTION USERNAME [OPTIONS]
+
+Manage MySQL 8+ users and databases for Vapor CP.
+
+Actions:
+    create    Create a new MySQL user (optionally with a database)
+    modify    Interactively modify an existing user
+    delete    Delete a user (optionally drop their databases)
+    list      List all MySQL users
+    info      Show details for a specific user
+
+Create:
+    $SCRIPT_NAME create USERNAME [HOST] [PASSWORD] [DBNAME] [ROLE]
+    
+    HOST      Allowed host (default: localhost). Use % for any host.
+    PASSWORD  Minimum 10 chars, letters+numbers (auto-generated if omitted)
+    DBNAME    If provided, creates the database and grants access
+    ROLE      standard (default) | readonly | admin
+
+Modify:
+    $SCRIPT_NAME modify USERNAME [HOST]
+    Interactive menu: change password, plugin, host, add db, revoke, lock.
+
+Delete:
+    $SCRIPT_NAME delete USERNAME [HOST] [drop-databases]
+    
+    drop-databases    Also DROP all databases the user has access to.
+
+List:
+    $SCRIPT_NAME list [FILTER]
+    FILTER    Optional username substring filter.
+
+Info:
+    $SCRIPT_NAME info USERNAME [HOST]
+
+Examples:
+    # Create user, auto-generate password
+    $SCRIPT_NAME create myuser
+
+    # Create user accessible from any host
+    $SCRIPT_NAME create myuser % 'SecurePass1'
+
+    # Create user + database with standard grants
+    $SCRIPT_NAME create myuser localhost 'SecurePass1' mydb
+
+    # Create readonly user on specific database
+    $SCRIPT_NAME create reporter localhost 'ReportPass1' analytics readonly
+
+    # Modify user interactively
+    $SCRIPT_NAME modify myuser localhost
+
+    # Delete user only
+    $SCRIPT_NAME delete myuser localhost
+
+    # Delete user AND all their databases
+    $SCRIPT_NAME delete myuser localhost drop-databases
+
+    # List all users
+    $SCRIPT_NAME list
+
+    # Filter users
+    $SCRIPT_NAME list myuser
+
+    # Show user details
+    $SCRIPT_NAME info myuser localhost
+
+Auth plugins (MySQL 8):
+    caching_sha2_password   Default, most secure (requires SSL or RSA)
+    mysql_native_password   Legacy, broader client compatibility
+
+Environment:
+    MYSQL_ROOT_PASSWORD     Set to skip interactive password prompt.
+                            Alternatively, configure /root/.my.cnf.
+
+Version: $VERSION
+EOF
+}
+
+################################################################################
+# Main
+################################################################################
+
+main() {
+    if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+
+    check_root
+    check_dependencies
+
+    local action="${1,,}"
+    validate_action "$action"
+    shift
+
+    # list doesn't need a username
+    if [[ "$action" == "list" ]]; then
+        get_mysql_root_password
+        check_mysql_connection
+        list_users "${1:-}"
+        exit 0
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        echo "Error: USERNAME is required." >&2
+        echo "Run '$SCRIPT_NAME --help' for usage." >&2
+        exit 1
+    fi
+
+    local username="$1"
+    validate_username "$username"
+    shift
+
+    get_mysql_root_password
+    check_mysql_connection
+
+    case "$action" in
+        create) create_user "$username" "${1:-localhost}" "${2:-}" "${3:-}" "${4:-standard}" ;;
+        modify) modify_user "$username" "${1:-localhost}" ;;
+        delete) delete_user "$username" "${1:-localhost}" "${2:-no}" ;;
+        info)   info_user "$username" "${1:-}" ;;
+    esac
+
+    exit 0
+}
+
+main "$@"
