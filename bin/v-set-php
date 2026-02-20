@@ -1,0 +1,989 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+################################################################################
+# Manage PHP-FPM pools per user for Vapor CP
+# Usage: v-set-phpfpm ACTION USERNAME [OPTIONS]
+# Version: 1.0.0
+################################################################################
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+
+# Paths
+readonly PHP_BASE_DIR="/etc/php"
+readonly FPM_SUBDIR="fpm/pool.d"
+readonly VAPOR_HOME="/home"
+readonly LOG_DIR="/var/log/vapor"
+readonly LOG_FILE="$LOG_DIR/phpfpm.log"
+
+# Defaults
+readonly DEFAULT_PHP_VERSION="${DEFAULT_PHP_VERSION:-8.2}"
+readonly DEFAULT_PM="${DEFAULT_PM:-ondemand}"           # static | dynamic | ondemand
+readonly DEFAULT_MAX_CHILDREN="${DEFAULT_MAX_CHILDREN:-5}"
+readonly DEFAULT_START_SERVERS="${DEFAULT_START_SERVERS:-2}"
+readonly DEFAULT_MIN_SPARE="${DEFAULT_MIN_SPARE:-1}"
+readonly DEFAULT_MAX_SPARE="${DEFAULT_MAX_SPARE:-3}"
+readonly DEFAULT_MAX_REQUESTS="${DEFAULT_MAX_REQUESTS:-500}"
+readonly DEFAULT_IDLE_TIMEOUT="${DEFAULT_IDLE_TIMEOUT:-10}"
+readonly DEFAULT_MEMORY_LIMIT="${DEFAULT_MEMORY_LIMIT:-256M}"
+readonly DEFAULT_UPLOAD_SIZE="${DEFAULT_UPLOAD_SIZE:-64M}"
+readonly DEFAULT_EXEC_TIME="${DEFAULT_EXEC_TIME:-300}"
+readonly DEFAULT_OPEN_BASEDIR="yes"
+
+################################################################################
+# Helpers
+################################################################################
+
+log_event() {
+    local user="$1" level="$2" message="$3"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    echo "[$ts] [$level] [phpfpm:$user] $message" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+print_separator() { echo "────────────────────────────────────────────────────"; }
+
+info()    { echo "  ✓ $*"; }
+warning() { echo "  ⚠ $*" >&2; }
+error()   { echo "  ✗ Error: $*" >&2; exit 1; }
+
+# Returns pool config path for a user+version
+pool_conf() {
+    local username="$1" php_ver="$2"
+    echo "$PHP_BASE_DIR/$php_ver/$FPM_SUBDIR/${username}.conf"
+}
+
+# Returns FPM service name
+fpm_service() {
+    echo "php${1}-fpm"
+}
+
+# Returns socket path for user+version
+socket_path() {
+    echo "/run/php/php${2}-fpm-${1}.sock"
+}
+
+# Returns PHP-FPM status socket (main, not per-user)
+fpm_pid() {
+    echo "/run/php/php${1}-fpm.pid"
+}
+
+################################################################################
+# Root & Dependency Check
+################################################################################
+
+check_root() {
+    [[ $EUID -ne 0 ]] && error "This script must be run as root."
+}
+
+check_dependencies() {
+    local missing=()
+    for cmd in awk sed grep systemctl; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [[ ${#missing[@]} -gt 0 ]] && error "Missing dependencies: ${missing[*]}"
+}
+
+################################################################################
+# Input Validation
+################################################################################
+
+validate_action() {
+    local action="$1"
+    local valid=("create" "modify" "delete" "enable" "disable" "reload" "list" "info" "status")
+    for v in "${valid[@]}"; do [[ "$action" == "$v" ]] && return 0; done
+    error "Invalid action '$action'. Valid: ${valid[*]}"
+}
+
+validate_username() {
+    local user="$1"
+    [[ ! "$user" =~ ^[a-z][a-z0-9_-]{1,30}$ ]] && \
+        error "Invalid username '$user'."
+    id "$user" &>/dev/null || error "System user '$user' does not exist."
+}
+
+validate_php_version() {
+    local ver="$1"
+    [[ ! "$ver" =~ ^[0-9]+\.[0-9]+$ ]] && \
+        error "Invalid PHP version '$ver'. Use format: 8.2"
+    [[ ! -d "$PHP_BASE_DIR/$ver/fpm" ]] && \
+        error "PHP $ver FPM is not installed. Try: apt install php${ver}-fpm"
+}
+
+validate_pm() {
+    local pm="$1"
+    [[ "$pm" =~ ^(static|dynamic|ondemand)$ ]] || \
+        error "Invalid PM '$pm'. Valid: static | dynamic | ondemand"
+}
+
+validate_memory() {
+    local mem="$1"
+    [[ ! "$mem" =~ ^[0-9]+(M|G|K)$ ]] && \
+        error "Invalid memory value '$mem'. Use e.g.: 256M, 1G"
+}
+
+validate_size() {
+    local val="$1"
+    [[ ! "$val" =~ ^[0-9]+(M|G|K)$ ]] && \
+        error "Invalid size '$val'. Use e.g.: 64M, 1G"
+}
+
+validate_int() {
+    local val="$1" name="$2"
+    [[ ! "$val" =~ ^[0-9]+$ ]] && error "$name must be a positive integer."
+    [[ "$val" -lt 1 ]]         && error "$name must be >= 1."
+}
+
+################################################################################
+# PHP version detection
+################################################################################
+
+detect_installed_versions() {
+    local versions=()
+    for dir in "$PHP_BASE_DIR"/*/fpm; do
+        [[ -d "$dir" ]] || continue
+        local ver; ver=$(echo "$dir" | grep -oP '[0-9]+\.[0-9]+')
+        versions+=("$ver")
+    done
+    echo "${versions[@]:-}"
+}
+
+detect_pool_version() {
+    local username="$1"
+    # Find which PHP versions have a pool for this user
+    local found=()
+    for dir in "$PHP_BASE_DIR"/*/fpm/pool.d; do
+        [[ -f "$dir/${username}.conf" ]] || continue
+        local ver; ver=$(echo "$dir" | grep -oP '[0-9]+\.[0-9]+')
+        found+=("$ver")
+    done
+    echo "${found[@]:-}"
+}
+
+################################################################################
+# Pool config generation
+################################################################################
+
+generate_pool_conf() {
+    local username="$1"
+    local php_ver="$2"
+    local pm="$3"
+    local max_children="$4"
+    local start_servers="$5"
+    local min_spare="$6"
+    local max_spare="$7"
+    local max_requests="$8"
+    local idle_timeout="$9"
+    local memory_limit="${10}"
+    local upload_size="${11}"
+    local exec_time="${12}"
+    local open_basedir="${13}"
+    local env_vars="${14:-}"       # colon-separated KEY=VALUE pairs
+
+    local sock; sock=$(socket_path "$username" "$php_ver")
+    local home_dir="$VAPOR_HOME/$username"
+    local log_file="$home_dir/logs/php-fpm.log"
+    local slow_log="$home_dir/logs/php-slow.log"
+
+    # Build open_basedir value
+    local basedir_value=""
+    if [[ "$open_basedir" == "yes" ]]; then
+        basedir_value="$home_dir/:/tmp/:/usr/share/php/:/dev/urandom"
+    fi
+
+    cat << EOF
+; ============================================================
+; Vapor CP — PHP-FPM Pool
+; User    : $username
+; PHP     : $php_ver
+; Created : $(date '+%Y-%m-%d %H:%M:%S')
+; ============================================================
+
+[$username]
+
+; --- Process & Socket ---
+user  = $username
+group = $username
+
+listen = $sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode  = 0660
+
+; --- Process Manager ---
+; pm: static | dynamic | ondemand
+pm = $pm
+pm.max_children     = $max_children
+EOF
+
+    if [[ "$pm" == "dynamic" ]]; then
+        cat << EOF
+pm.start_servers     = $start_servers
+pm.min_spare_servers = $min_spare
+pm.max_spare_servers = $max_spare
+EOF
+    elif [[ "$pm" == "ondemand" ]]; then
+        cat << EOF
+pm.process_idle_timeout = ${idle_timeout}s
+EOF
+    fi
+
+    cat << EOF
+pm.max_requests      = $max_requests
+
+; --- Logging ---
+access.log           = $log_file
+access.format        = "%R - %u %t \"%m %r%Q%q\" %s %f %{mili}d ms %{kilo}M KB cpu:%C%%"
+slowlog              = $slow_log
+request_slowlog_timeout = 5s
+php_flag[log_errors] = on
+php_value[error_log] = $log_file
+
+; --- PHP Settings ---
+php_admin_value[memory_limit]       = $memory_limit
+php_admin_value[upload_max_filesize] = $upload_size
+php_admin_value[post_max_size]      = $upload_size
+php_admin_value[max_execution_time] = $exec_time
+php_admin_value[max_input_time]     = $exec_time
+php_admin_value[max_input_vars]     = 5000
+php_admin_flag[display_errors]      = off
+php_admin_flag[expose_php]          = off
+
+; --- Session ---
+php_admin_value[session.save_handler] = files
+php_admin_value[session.save_path]    = $home_dir/sessions
+php_admin_value[session.gc_maxlifetime] = 1440
+
+; --- Temp Dirs ---
+php_admin_value[upload_tmp_dir]  = $home_dir/tmp
+php_admin_value[sys_temp_dir]    = $home_dir/tmp
+
+EOF
+
+    if [[ -n "$basedir_value" ]]; then
+        echo "php_admin_value[open_basedir] = $basedir_value"
+        echo ""
+    fi
+
+    # Environment variables
+    if [[ -n "$env_vars" ]]; then
+        echo "; --- Environment Variables ---"
+        IFS=':' read -ra pairs <<< "$env_vars"
+        for pair in "${pairs[@]}"; do
+            [[ "$pair" =~ ^([^=]+)=(.*)$ ]] && \
+                echo "env[${BASH_REMATCH[1]}] = ${BASH_REMATCH[2]}"
+        done
+        echo ""
+    fi
+
+    cat << EOF
+; --- Security ---
+; Prevents access to files outside home dir
+security.limit_extensions = .php .phtml
+
+; --- Status & Ping ---
+pm.status_path = /fpm-status-$username
+ping.path      = /fpm-ping-$username
+ping.response  = pong
+
+; --- Timeouts ---
+request_terminate_timeout = ${exec_time}s
+EOF
+}
+
+################################################################################
+# CREATE
+################################################################################
+
+create_pool() {
+    local username="$1"
+    local php_ver="${2:-$DEFAULT_PHP_VERSION}"
+
+    validate_php_version "$php_ver"
+
+    local conf_file; conf_file=$(pool_conf "$username" "$php_ver")
+    [[ -f "$conf_file" ]] && \
+        error "Pool for '$username' (PHP $php_ver) already exists: $conf_file"
+
+    echo "Configuring PHP-FPM pool for '$username' (PHP $php_ver)..."
+    echo ""
+
+    # Interactive config wizard
+    echo "  Process Manager:"
+    echo "    1) ondemand  — spawns workers on request, frees memory when idle (recommended for shared hosting)"
+    echo "    2) dynamic   — maintains a range of workers (recommended for busy sites)"
+    echo "    3) static    — fixed number of workers (recommended for high-traffic dedicated sites)"
+    echo -n "  Choice [1-3, default: 1]: "
+    read -r pm_choice
+    local pm
+    case "${pm_choice:-1}" in
+        2) pm="dynamic" ;;
+        3) pm="static" ;;
+        *) pm="ondemand" ;;
+    esac
+
+    echo -n "  Max children       [default: $DEFAULT_MAX_CHILDREN]: "
+    read -r max_children; max_children="${max_children:-$DEFAULT_MAX_CHILDREN}"
+    validate_int "$max_children" "max_children"
+
+    local start_servers="$DEFAULT_START_SERVERS"
+    local min_spare="$DEFAULT_MIN_SPARE"
+    local max_spare="$DEFAULT_MAX_SPARE"
+    local idle_timeout="$DEFAULT_IDLE_TIMEOUT"
+
+    if [[ "$pm" == "dynamic" ]]; then
+        echo -n "  Start servers      [default: $DEFAULT_START_SERVERS]: "
+        read -r start_servers; start_servers="${start_servers:-$DEFAULT_START_SERVERS}"
+        validate_int "$start_servers" "start_servers"
+        echo -n "  Min spare servers  [default: $DEFAULT_MIN_SPARE]: "
+        read -r min_spare; min_spare="${min_spare:-$DEFAULT_MIN_SPARE}"
+        echo -n "  Max spare servers  [default: $DEFAULT_MAX_SPARE]: "
+        read -r max_spare; max_spare="${max_spare:-$DEFAULT_MAX_SPARE}"
+    elif [[ "$pm" == "ondemand" ]]; then
+        echo -n "  Idle timeout (sec) [default: $DEFAULT_IDLE_TIMEOUT]: "
+        read -r idle_timeout; idle_timeout="${idle_timeout:-$DEFAULT_IDLE_TIMEOUT}"
+        validate_int "$idle_timeout" "idle_timeout"
+    fi
+
+    echo -n "  Max requests/worker [default: $DEFAULT_MAX_REQUESTS]: "
+    read -r max_requests; max_requests="${max_requests:-$DEFAULT_MAX_REQUESTS}"
+    validate_int "$max_requests" "max_requests"
+
+    echo -n "  Memory limit       [default: $DEFAULT_MEMORY_LIMIT]: "
+    read -r memory_limit; memory_limit="${memory_limit:-$DEFAULT_MEMORY_LIMIT}"
+    validate_memory "$memory_limit"
+
+    echo -n "  Upload max size    [default: $DEFAULT_UPLOAD_SIZE]: "
+    read -r upload_size; upload_size="${upload_size:-$DEFAULT_UPLOAD_SIZE}"
+    validate_size "$upload_size"
+
+    echo -n "  Max execution time [default: $DEFAULT_EXEC_TIME]: "
+    read -r exec_time; exec_time="${exec_time:-$DEFAULT_EXEC_TIME}"
+    validate_int "$exec_time" "exec_time"
+
+    echo -n "  Enable open_basedir security? [Y/n]: "
+    read -r ob_choice
+    local open_basedir="yes"
+    [[ "${ob_choice,,}" == "n" ]] && open_basedir="no"
+
+    echo -n "  Environment variables? (KEY=VAL:KEY2=VAL2 or empty): "
+    read -r env_vars
+
+    # Ensure required directories exist
+    local home_dir="$VAPOR_HOME/$username"
+    for dir in logs sessions tmp; do
+        mkdir -p "$home_dir/$dir" 2>/dev/null || true
+        chown "$username":"$username" "$home_dir/$dir" 2>/dev/null || true
+    done
+    chmod 700 "$home_dir/sessions" 2>/dev/null || true
+
+    # Write config
+    generate_pool_conf \
+        "$username" "$php_ver" "$pm" \
+        "$max_children" "$start_servers" "$min_spare" "$max_spare" \
+        "$max_requests" "$idle_timeout" \
+        "$memory_limit" "$upload_size" "$exec_time" \
+        "$open_basedir" "${env_vars:-}" \
+    > "$conf_file"
+
+    info "Pool config written: $conf_file"
+
+    # Save Vapor CP metadata
+    _save_pool_meta "$username" "$php_ver" "$pm" "$memory_limit" "$upload_size" "$exec_time"
+
+    # Reload FPM
+    _reload_fpm "$php_ver"
+
+    log_event "$username" "INFO" "pool created php=$php_ver pm=$pm mem=$memory_limit"
+
+    print_separator
+    echo "  User    : $username"
+    echo "  PHP     : $php_ver"
+    echo "  PM      : $pm"
+    echo "  Socket  : $(socket_path "$username" "$php_ver")"
+    echo "  Config  : $conf_file"
+    echo ""
+    echo "  Use this socket in Nginx:"
+    echo "    fastcgi_pass unix:$(socket_path "$username" "$php_ver");"
+    print_separator
+}
+
+_save_pool_meta() {
+    local username="$1" php_ver="$2" pm="$3" mem="$4" upload="$5" exec_t="$6"
+    local conf_dir="$VAPOR_HOME/$username/conf"
+    [[ ! -d "$conf_dir" ]] && return
+    local meta="$conf_dir/phpfpm_${php_ver}.conf"
+    cat > "$meta" << EOF
+# Vapor CP PHP-FPM Pool Metadata
+PHP_VERSION='$php_ver'
+PM='$pm'
+MEMORY_LIMIT='$mem'
+UPLOAD_SIZE='$upload'
+EXEC_TIME='$exec_t'
+SOCKET='$(socket_path "$username" "$php_ver")'
+POOL_CONF='$(pool_conf "$username" "$php_ver")'
+CREATED='$(date '+%Y-%m-%d %H:%M:%S')'
+EOF
+    chmod 600 "$meta"
+    chown "$username":"$username" "$meta" 2>/dev/null || true
+}
+
+################################################################################
+# MODIFY
+################################################################################
+
+modify_pool() {
+    local username="$1"
+    local php_ver="${2:-}"
+
+    # Auto-detect version if not given
+    if [[ -z "$php_ver" ]]; then
+        local versions; versions=$(detect_pool_version "$username")
+        local ver_count; ver_count=$(echo "$versions" | wc -w)
+        if [[ "$ver_count" -eq 0 ]]; then
+            error "No PHP-FPM pool found for '$username'."
+        elif [[ "$ver_count" -eq 1 ]]; then
+            php_ver="$versions"
+        else
+            echo "Multiple pools found for '$username': $versions"
+            echo -n "Which PHP version to modify? "; read -r php_ver
+        fi
+    fi
+
+    validate_php_version "$php_ver"
+    local conf_file; conf_file=$(pool_conf "$username" "$php_ver")
+    [[ ! -f "$conf_file" ]] && error "Pool config not found: $conf_file"
+
+    echo "Modifying PHP-FPM pool for '$username' (PHP $php_ver)..."
+    echo ""
+    echo "  1)  Change PM type"
+    echo "  2)  Change pm.max_children"
+    echo "  3)  Change memory_limit"
+    echo "  4)  Change upload_max_filesize / post_max_size"
+    echo "  5)  Change max_execution_time"
+    echo "  6)  Change max_requests per worker"
+    echo "  7)  Toggle open_basedir"
+    echo "  8)  Add/update environment variable"
+    echo "  9)  Remove environment variable"
+    echo " 10)  Change open_basedir path"
+    echo " 11)  Recreate pool from scratch"
+    echo -n "Choice [1-11]: "
+    read -r choice
+
+    case "$choice" in
+        1)
+            echo -n "New PM [static/dynamic/ondemand]: "; read -r new_pm
+            validate_pm "$new_pm"
+            sed -i "s/^pm = .*/pm = $new_pm/" "$conf_file"
+            info "PM changed to $new_pm"
+            ;;
+        2)
+            echo -n "New max_children: "; read -r val
+            validate_int "$val" "max_children"
+            sed -i "s/^pm.max_children.*/pm.max_children     = $val/" "$conf_file"
+            info "max_children set to $val"
+            ;;
+        3)
+            echo -n "New memory_limit (e.g. 512M): "; read -r val
+            validate_memory "$val"
+            sed -i "s/^php_admin_value\[memory_limit\].*/php_admin_value[memory_limit]       = $val/" "$conf_file"
+            info "memory_limit set to $val"
+            ;;
+        4)
+            echo -n "New upload/post max size (e.g. 128M): "; read -r val
+            validate_size "$val"
+            sed -i "s/^php_admin_value\[upload_max_filesize\].*/php_admin_value[upload_max_filesize] = $val/" "$conf_file"
+            sed -i "s/^php_admin_value\[post_max_size\].*/php_admin_value[post_max_size]      = $val/" "$conf_file"
+            info "upload/post max size set to $val"
+            ;;
+        5)
+            echo -n "New max_execution_time (seconds): "; read -r val
+            validate_int "$val" "max_execution_time"
+            sed -i "s/^php_admin_value\[max_execution_time\].*/php_admin_value[max_execution_time] = $val/" "$conf_file"
+            sed -i "s/^php_admin_value\[max_input_time\].*/php_admin_value[max_input_time]     = $val/" "$conf_file"
+            sed -i "s/^request_terminate_timeout.*/request_terminate_timeout = ${val}s/" "$conf_file"
+            info "max_execution_time set to ${val}s"
+            ;;
+        6)
+            echo -n "New max_requests per worker: "; read -r val
+            validate_int "$val" "max_requests"
+            sed -i "s/^pm.max_requests.*/pm.max_requests      = $val/" "$conf_file"
+            info "max_requests set to $val"
+            ;;
+        7)
+            if grep -q "^php_admin_value\[open_basedir\]" "$conf_file"; then
+                sed -i "/^php_admin_value\[open_basedir\]/d" "$conf_file"
+                info "open_basedir disabled"
+            else
+                local home_dir="$VAPOR_HOME/$username"
+                local basedir="$home_dir/:/tmp/:/usr/share/php/:/dev/urandom"
+                echo "" >> "$conf_file"
+                echo "php_admin_value[open_basedir] = $basedir" >> "$conf_file"
+                info "open_basedir enabled: $basedir"
+            fi
+            ;;
+        8)
+            echo -n "Variable name: "; read -r env_name
+            echo -n "Variable value: "; read -r env_val
+            if grep -q "^env\[$env_name\]" "$conf_file"; then
+                sed -i "s|^env\[$env_name\].*|env[$env_name] = $env_val|" "$conf_file"
+                info "env[$env_name] updated"
+            else
+                echo "env[$env_name] = $env_val" >> "$conf_file"
+                info "env[$env_name] added"
+            fi
+            ;;
+        9)
+            echo -n "Variable name to remove: "; read -r env_name
+            sed -i "/^env\[$env_name\]/d" "$conf_file"
+            info "env[$env_name] removed"
+            ;;
+        10)
+            echo -n "New open_basedir path (colon-separated): "; read -r new_path
+            if grep -q "^php_admin_value\[open_basedir\]" "$conf_file"; then
+                sed -i "s|^php_admin_value\[open_basedir\].*|php_admin_value[open_basedir] = $new_path|" "$conf_file"
+            else
+                echo "php_admin_value[open_basedir] = $new_path" >> "$conf_file"
+            fi
+            info "open_basedir set to: $new_path"
+            ;;
+        11)
+            rm -f "$conf_file"
+            create_pool "$username" "$php_ver"
+            return
+            ;;
+        *) error "Invalid choice." ;;
+    esac
+
+    _reload_fpm "$php_ver"
+    log_event "$username" "INFO" "pool modified php=$php_ver choice=$choice"
+    info "Pool for '$username' (PHP $php_ver) updated and reloaded"
+}
+
+################################################################################
+# DELETE
+################################################################################
+
+delete_pool() {
+    local username="$1"
+    local php_ver="${2:-}"
+
+    if [[ -z "$php_ver" ]]; then
+        local versions; versions=$(detect_pool_version "$username")
+        [[ -z "$versions" ]] && error "No PHP-FPM pool found for '$username'."
+        local ver_count; ver_count=$(echo "$versions" | wc -w)
+        if [[ "$ver_count" -gt 1 ]]; then
+            echo "Multiple pools found: $versions"
+            echo -n "Which PHP version to delete? (or 'all'): "; read -r php_ver
+        else
+            php_ver="$versions"
+        fi
+    fi
+
+    if [[ "$php_ver" == "all" ]]; then
+        for ver in $(detect_pool_version "$username"); do
+            _delete_single_pool "$username" "$ver"
+        done
+        return
+    fi
+
+    validate_php_version "$php_ver"
+    _delete_single_pool "$username" "$php_ver"
+}
+
+_delete_single_pool() {
+    local username="$1" php_ver="$2"
+    local conf_file; conf_file=$(pool_conf "$username" "$php_ver")
+    [[ ! -f "$conf_file" ]] && error "Pool config not found: $conf_file"
+
+    echo "WARNING: Deleting PHP-FPM pool for '$username' (PHP $php_ver)."
+    read -p "Are you sure? (yes/no): " -r confirm
+    [[ "$confirm" != "yes" ]] && echo "Cancelled." && return
+
+    rm -f "$conf_file"
+    rm -f "$VAPOR_HOME/$username/conf/phpfpm_${php_ver}.conf" 2>/dev/null || true
+    _reload_fpm "$php_ver"
+
+    log_event "$username" "INFO" "pool deleted php=$php_ver"
+    info "Pool for '$username' (PHP $php_ver) deleted"
+}
+
+################################################################################
+# ENABLE / DISABLE
+################################################################################
+
+enable_pool() {
+    local username="$1" php_ver="${2:-$DEFAULT_PHP_VERSION}"
+    validate_php_version "$php_ver"
+    local conf_file; conf_file=$(pool_conf "$username" "$php_ver")
+    [[ ! -f "$conf_file" ]] && error "Pool config not found: $conf_file"
+
+    # Disabled pools are renamed to .conf.disabled
+    local disabled="${conf_file}.disabled"
+    if [[ -f "$disabled" ]]; then
+        mv "$disabled" "$conf_file"
+        _reload_fpm "$php_ver"
+        log_event "$username" "INFO" "pool enabled php=$php_ver"
+        info "Pool for '$username' (PHP $php_ver) enabled"
+    else
+        warning "Pool is already enabled."
+    fi
+}
+
+disable_pool() {
+    local username="$1" php_ver="${2:-$DEFAULT_PHP_VERSION}"
+    validate_php_version "$php_ver"
+    local conf_file; conf_file=$(pool_conf "$username" "$php_ver")
+    [[ ! -f "$conf_file" ]] && error "Pool config not found: $conf_file"
+
+    mv "$conf_file" "${conf_file}.disabled"
+    _reload_fpm "$php_ver"
+    log_event "$username" "INFO" "pool disabled php=$php_ver"
+    info "Pool for '$username' (PHP $php_ver) disabled (config preserved as .disabled)"
+}
+
+################################################################################
+# RELOAD
+################################################################################
+
+reload_pool() {
+    local php_ver="${1:-}"
+    if [[ -z "$php_ver" ]]; then
+        # Reload all installed FPM versions
+        for ver in $(detect_installed_versions); do
+            _reload_fpm "$ver"
+        done
+    else
+        validate_php_version "$php_ver"
+        _reload_fpm "$php_ver"
+    fi
+}
+
+_reload_fpm() {
+    local php_ver="$1"
+    local svc; svc=$(fpm_service "$php_ver")
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl reload "$svc" 2>/dev/null && info "$svc reloaded" || \
+            warning "Could not reload $svc. Run: systemctl reload $svc"
+    else
+        warning "$svc is not running. Start it with: systemctl start $svc"
+    fi
+}
+
+################################################################################
+# STATUS
+################################################################################
+
+status_pool() {
+    local username="${1:-}"
+    local php_ver="${2:-}"
+
+    echo ""
+    echo "PHP-FPM Service Status:"
+    print_separator
+
+    for ver in $(detect_installed_versions); do
+        local svc; svc=$(fpm_service "$ver")
+        local state
+        state=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
+        local pid_file; pid_file=$(fpm_pid "$ver")
+        local pid="—"
+        [[ -f "$pid_file" ]] && pid=$(cat "$pid_file")
+        printf "  php%-4s %-12s PID: %-8s\n" "$ver" "$state" "$pid"
+    done
+
+    echo ""
+    echo "Active Sockets:"
+    print_separator
+    local socks; socks=$(find /run/php/ -name "*.sock" 2>/dev/null || true)
+    if [[ -n "$socks" ]]; then
+        echo "$socks" | sed 's/^/  /'
+    else
+        echo "  (none found)"
+    fi
+
+    if [[ -n "$username" ]]; then
+        echo ""
+        echo "Pools for '$username':"
+        print_separator
+        local versions; versions=$(detect_pool_version "$username")
+        if [[ -z "$versions" ]]; then
+            echo "  (no pools found)"
+        else
+            for ver in $versions; do
+                local sock; sock=$(socket_path "$username" "$ver")
+                local sock_state="missing"
+                [[ -S "$sock" ]] && sock_state="active"
+                printf "  PHP %-6s socket: %-10s  %s\n" "$ver" "$sock_state" "$sock"
+            done
+        fi
+    fi
+    echo ""
+}
+
+################################################################################
+# LIST
+################################################################################
+
+list_pools() {
+    local filter="${1:-}"
+    echo ""
+    echo "PHP-FPM Pools:"
+    print_separator
+    printf "%-20s %-8s %-12s %-10s %-10s %-6s\n" "USER" "PHP" "PM" "MAX_CH" "MEMORY" "STATUS"
+    print_separator
+
+    for ver_dir in "$PHP_BASE_DIR"/*/fpm/pool.d; do
+        [[ -d "$ver_dir" ]] || continue
+        local ver; ver=$(echo "$ver_dir" | grep -oP '[0-9]+\.[0-9]+')
+
+        for conf in "$ver_dir"/*.conf "$ver_dir"/*.conf.disabled; do
+            [[ -f "$conf" ]] || continue
+            local base; base=$(basename "$conf")
+            # Skip www.conf (default pool)
+            [[ "$base" == "www.conf" || "$base" == "www.conf.disabled" ]] && continue
+
+            local user; user="${base%.conf.disabled}"; user="${user%.conf}"
+            [[ -n "$filter" ]] && [[ "$user" != *"$filter"* ]] && continue
+
+            local pm mem max_ch status
+            pm=$(awk -F'=' '/^pm =/{gsub(/ /,"",$2); print $2}' "$conf" 2>/dev/null || echo "?")
+            mem=$(awk -F'=' '/memory_limit/{gsub(/ /,"",$2); print $2}' "$conf" 2>/dev/null | head -1 || echo "?")
+            max_ch=$(awk -F'=' '/^pm.max_children/{gsub(/ /,"",$2); print $2}' "$conf" 2>/dev/null || echo "?")
+            status="enabled"
+            [[ "$conf" == *.disabled ]] && status="disabled"
+
+            printf "%-20s %-8s %-12s %-10s %-10s %-6s\n" \
+                "$user" "$ver" "$pm" "$max_ch" "$mem" "$status"
+        done
+    done
+    echo ""
+}
+
+################################################################################
+# INFO
+################################################################################
+
+info_pool() {
+    local username="$1"
+    local php_ver="${2:-}"
+
+    if [[ -z "$php_ver" ]]; then
+        local versions; versions=$(detect_pool_version "$username")
+        [[ -z "$versions" ]] && error "No PHP-FPM pool found for '$username'."
+        php_ver=$(echo "$versions" | awk '{print $1}')
+        [[ $(echo "$versions" | wc -w) -gt 1 ]] && \
+            warning "Multiple pools found: $versions — showing PHP $php_ver. Pass version to specify."
+    fi
+
+    validate_php_version "$php_ver"
+    local conf_file; conf_file=$(pool_conf "$username" "$php_ver")
+    local disabled_conf="${conf_file}.disabled"
+
+    local actual_conf=""
+    [[ -f "$conf_file" ]]          && actual_conf="$conf_file"
+    [[ -f "$disabled_conf" ]]      && actual_conf="$disabled_conf"
+    [[ -z "$actual_conf" ]]        && error "Pool config not found for '$username' (PHP $php_ver)."
+
+    echo ""
+    echo "PHP-FPM Pool Info: $username (PHP $php_ver)"
+    print_separator
+
+    local sock; sock=$(socket_path "$username" "$php_ver")
+    local sock_state="not running"
+    [[ -S "$sock" ]] && sock_state="active"
+
+    echo "  Config file  : $actual_conf"
+    echo "  Socket       : $sock ($sock_state)"
+    echo "  Status       : $([[ -f "$conf_file" ]] && echo enabled || echo disabled)"
+    echo ""
+
+    # Parse key values from conf
+    local keys=(
+        "pm" "pm.max_children" "pm.start_servers"
+        "pm.min_spare_servers" "pm.max_spare_servers"
+        "pm.process_idle_timeout" "pm.max_requests"
+    )
+    echo "  Process Manager:"
+    for key in "${keys[@]}"; do
+        local val
+        val=$(grep -P "^${key//./\\.}\s*=" "$actual_conf" 2>/dev/null | awk -F'=' '{gsub(/ /,"",$2); print $2}' | head -1 || true)
+        [[ -n "$val" ]] && printf "    %-35s %s\n" "$key" "$val"
+    done
+
+    echo ""
+    echo "  PHP Settings:"
+    local php_keys=(
+        "memory_limit" "upload_max_filesize" "post_max_size"
+        "max_execution_time" "max_input_vars" "open_basedir"
+        "session.save_path" "upload_tmp_dir"
+    )
+    for key in "${php_keys[@]}"; do
+        local val
+        val=$(grep "php_admin_value\[$key\]" "$actual_conf" 2>/dev/null | awk -F'=' '{gsub(/^ /,"",$2); print $2}' | head -1 || true)
+        [[ -n "$val" ]] && printf "    %-35s %s\n" "$key" "$val"
+    done
+
+    echo ""
+    echo "  Environment Variables:"
+    local envs
+    envs=$(grep "^env\[" "$actual_conf" 2>/dev/null || true)
+    if [[ -n "$envs" ]]; then
+        echo "$envs" | sed 's/^/    /'
+    else
+        echo "    (none)"
+    fi
+
+    echo ""
+    echo "  Log files:"
+    echo "    $VAPOR_HOME/$username/logs/php-fpm.log"
+    echo "    $VAPOR_HOME/$username/logs/php-slow.log"
+
+    # Vapor CP meta
+    local meta="$VAPOR_HOME/$username/conf/phpfpm_${php_ver}.conf"
+    if [[ -f "$meta" ]]; then
+        echo ""
+        echo "  Created      : $(grep CREATED "$meta" | cut -d"'" -f2)"
+    fi
+
+    print_separator
+}
+
+################################################################################
+# Usage
+################################################################################
+
+show_usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME ACTION USERNAME [PHP_VERSION] [OPTIONS]
+
+Manage PHP-FPM pools per user for Vapor CP.
+Each user gets an isolated pool with its own socket, limits and settings.
+
+Actions:
+    create    Create a new PHP-FPM pool (interactive wizard)
+    modify    Interactively modify an existing pool
+    delete    Delete a pool
+    enable    Re-enable a disabled pool
+    disable   Disable a pool (keeps config as .disabled)
+    reload    Reload PHP-FPM service(s)
+    status    Show FPM service status and active sockets
+    list      List all pools
+    info      Show full details of a pool
+
+Arguments:
+    USERNAME      System user (must exist)
+    PHP_VERSION   PHP version, e.g. 8.2 (default: $DEFAULT_PHP_VERSION)
+
+Examples:
+    # Create pool for user with PHP 8.2 (interactive)
+    $SCRIPT_NAME create myuser 8.2
+
+    # Create pool with default PHP version
+    $SCRIPT_NAME create myuser
+
+    # Modify pool interactively
+    $SCRIPT_NAME modify myuser 8.2
+
+    # Show pool details
+    $SCRIPT_NAME info myuser 8.2
+
+    # List all pools
+    $SCRIPT_NAME list
+
+    # Filter list by username
+    $SCRIPT_NAME list myuser
+
+    # Check service status (all users)
+    $SCRIPT_NAME status
+
+    # Check status for specific user
+    $SCRIPT_NAME status myuser
+
+    # Disable pool temporarily
+    $SCRIPT_NAME disable myuser 8.2
+
+    # Re-enable pool
+    $SCRIPT_NAME enable myuser 8.2
+
+    # Delete pool
+    $SCRIPT_NAME delete myuser 8.2
+
+    # Delete all pools for a user
+    $SCRIPT_NAME delete myuser all
+
+    # Reload all FPM versions
+    $SCRIPT_NAME reload
+
+    # Reload specific FPM version
+    $SCRIPT_NAME reload "" 8.2
+
+Pool config location:
+    /etc/php/PHP_VERSION/fpm/pool.d/USERNAME.conf
+
+Socket location:
+    /run/php/phpPHP_VERSION-fpm-USERNAME.sock
+
+Nginx usage:
+    fastcgi_pass unix:/run/php/phpPHP_VERSION-fpm-USERNAME.sock;
+
+Environment:
+    DEFAULT_PHP_VERSION    Default PHP version (currently: $DEFAULT_PHP_VERSION)
+
+Version: $VERSION
+EOF
+}
+
+################################################################################
+# Main
+################################################################################
+
+main() {
+    if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+
+    check_root
+    check_dependencies
+
+    local action="${1,,}"; shift
+    validate_action "$action"
+
+    # Actions that don't need a username
+    case "$action" in
+        list)
+            list_pools "${1:-}"
+            exit 0
+            ;;
+        reload)
+            reload_pool "${1:-}"
+            exit 0
+            ;;
+        status)
+            status_pool "${1:-}" "${2:-}"
+            exit 0
+            ;;
+    esac
+
+    [[ $# -eq 0 ]] && error "USERNAME is required."
+    local username="$1"; shift
+    validate_username "$username"
+
+    local php_ver="${1:-}"; [[ -n "${1:-}" ]] && shift
+
+    case "$action" in
+        create)  create_pool  "$username" "${php_ver:-$DEFAULT_PHP_VERSION}" ;;
+        modify)  modify_pool  "$username" "${php_ver:-}" ;;
+        delete)  delete_pool  "$username" "${php_ver:-}" ;;
+        enable)  enable_pool  "$username" "${php_ver:-$DEFAULT_PHP_VERSION}" ;;
+        disable) disable_pool "$username" "${php_ver:-$DEFAULT_PHP_VERSION}" ;;
+        info)    info_pool    "$username" "${php_ver:-}" ;;
+    esac
+
+    exit 0
+}
+
+main "$@"
