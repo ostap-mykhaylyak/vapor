@@ -1,0 +1,963 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+################################################################################
+# Manage Nginx virtual hosts for Vapor CP
+# Supports: PHP-FPM, Reverse Proxy, Static
+# Usage: v-set-nginx ACTION USERNAME DOMAIN [OPTIONS]
+# Version: 1.0.0
+################################################################################
+
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+
+# Paths
+readonly NGINX_BIN="${NGINX_BIN:-/usr/sbin/nginx}"
+readonly NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx}"
+readonly NGINX_SITES_AVAILABLE="$NGINX_CONF_DIR/sites-available"
+readonly NGINX_SITES_ENABLED="$NGINX_CONF_DIR/sites-enabled"
+readonly NGINX_SNIPPETS_DIR="$NGINX_CONF_DIR/snippets/vapor"
+readonly VAPOR_HOME="/home"
+readonly LOG_DIR="/var/log/vapor"
+readonly LOG_FILE="$LOG_DIR/nginx.log"
+
+# Defaults
+readonly DEFAULT_PHP_VERSION="${DEFAULT_PHP_VERSION:-8.2}"
+readonly DEFAULT_PHP_POOL_SOCKET="/run/php/php${DEFAULT_PHP_VERSION}-fpm.sock"
+
+################################################################################
+# Helpers
+################################################################################
+
+log_event() {
+    local user="$1" level="$2" message="$3"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    echo "[$ts] [$level] [nginx:$user] $message" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+print_separator() { echo "────────────────────────────────────────────────────"; }
+
+info()    { echo "  ✓ $*"; }
+warning() { echo "  ⚠ $*" >&2; }
+error()   { echo "  ✗ Error: $*" >&2; exit 1; }
+
+site_conf()    { echo "$NGINX_SITES_AVAILABLE/${1}.conf"; }
+site_enabled() { echo "$NGINX_SITES_ENABLED/${1}.conf"; }
+
+################################################################################
+# Root & Dependency Check
+################################################################################
+
+check_root() {
+    [[ $EUID -ne 0 ]] && error "This script must be run as root."
+}
+
+check_dependencies() {
+    local deps=("nginx" "openssl" "certbot" "php-fpm${DEFAULT_PHP_VERSION}" "awk" "sed")
+    local missing=()
+    for cmd in nginx openssl awk sed; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Missing required dependencies: ${missing[*]}"
+    fi
+    # certbot is optional
+    command -v certbot &>/dev/null || warning "certbot not found — SSL via Let's Encrypt will be unavailable."
+}
+
+nginx_test() {
+    if ! "$NGINX_BIN" -t 2>/dev/null; then
+        error "Nginx configuration test failed. Run 'nginx -t' for details."
+    fi
+}
+
+nginx_reload() {
+    nginx_test
+    systemctl reload nginx 2>/dev/null || "$NGINX_BIN" -s reload 2>/dev/null || \
+        warning "Could not reload nginx automatically. Run: systemctl reload nginx"
+    info "Nginx reloaded"
+}
+
+################################################################################
+# Input Validation
+################################################################################
+
+validate_action() {
+    local action="$1"
+    local valid=("create" "modify" "delete" "enable" "disable" "list" "info" "ssl")
+    for v in "${valid[@]}"; do [[ "$action" == "$v" ]] && return 0; done
+    error "Invalid action '$action'. Valid: ${valid[*]}"
+}
+
+validate_username() {
+    local user="$1"
+    [[ ! "$user" =~ ^[a-z][a-z0-9_-]{1,30}$ ]] && \
+        error "Invalid username '$user'. Must be 2-31 chars, lowercase, start with letter."
+    id "$user" &>/dev/null || error "System user '$user' does not exist."
+}
+
+validate_domain() {
+    local domain="$1"
+    [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$ ]] && \
+        error "Invalid domain name '$domain'."
+}
+
+validate_port() {
+    local port="$1"
+    [[ ! "$port" =~ ^[0-9]{2,5}$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]] && \
+        error "Invalid port '$port'."
+}
+
+validate_php_version() {
+    local ver="$1"
+    [[ ! "$ver" =~ ^[0-9]+\.[0-9]+$ ]] && error "Invalid PHP version '$ver'. Use format: 8.2"
+    local sock="/run/php/php${ver}-fpm.sock"
+    [[ ! -S "$sock" ]] && warning "PHP-FPM socket not found: $sock (is php${ver}-fpm running?)"
+}
+
+validate_type() {
+    local type="$1"
+    local valid=("php" "proxy" "static")
+    for v in "${valid[@]}"; do [[ "$type" == "$v" ]] && return 0; done
+    error "Invalid type '$type'. Valid: php | proxy | static"
+}
+
+################################################################################
+# Snippets (shared nginx includes)
+################################################################################
+
+create_snippets() {
+    mkdir -p "$NGINX_SNIPPETS_DIR"
+
+    # Security headers snippet
+    cat > "$NGINX_SNIPPETS_DIR/security-headers.conf" << 'EOF'
+# Vapor CP — Security Headers
+add_header X-Content-Type-Options    "nosniff"         always;
+add_header X-Frame-Options           "SAMEORIGIN"      always;
+add_header X-XSS-Protection          "1; mode=block"   always;
+add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy        "geolocation=(), microphone=(), camera=()" always;
+EOF
+
+    # Static assets caching snippet
+    cat > "$NGINX_SNIPPETS_DIR/static-cache.conf" << 'EOF'
+# Vapor CP — Static Asset Caching
+location ~* \.(jpg|jpeg|png|gif|ico|svg|webp|woff|woff2|ttf|otf|eot|css|js|map)$ {
+    expires 30d;
+    add_header Cache-Control "public, immutable";
+    access_log off;
+    log_not_found off;
+}
+EOF
+
+    # Deny hidden files snippet
+    cat > "$NGINX_SNIPPETS_DIR/deny-dotfiles.conf" << 'EOF'
+# Vapor CP — Deny hidden files
+location ~ /\. {
+    deny all;
+    access_log off;
+    log_not_found off;
+}
+EOF
+
+    # PHP-FPM fastcgi params snippet
+    cat > "$NGINX_SNIPPETS_DIR/fastcgi-php.conf" << 'EOF'
+# Vapor CP — FastCGI PHP params
+fastcgi_split_path_info ^(.+\.php)(/.+)$;
+fastcgi_index            index.php;
+fastcgi_param            SCRIPT_FILENAME $document_root$fastcgi_script_name;
+include                  fastcgi_params;
+fastcgi_param            HTTP_PROXY "";
+fastcgi_read_timeout     300;
+fastcgi_buffer_size      16k;
+fastcgi_buffers          4 16k;
+EOF
+
+    info "Nginx snippets created in $NGINX_SNIPPETS_DIR"
+}
+
+################################################################################
+# Template: PHP-FPM vhost
+################################################################################
+
+generate_php_vhost() {
+    local username="$1" domain="$2" php_ver="$3"
+    local root="$VAPOR_HOME/$username/public_html"
+    local sock="/run/php/php${php_ver}-fpm.sock"
+    local access_log="/var/log/nginx/${domain}.access.log"
+    local error_log="/var/log/nginx/${domain}.error.log"
+
+    cat << EOF
+# Vapor CP — PHP-FPM vhost
+# User   : $username
+# Domain : $domain
+# PHP    : $php_ver
+# Created: $(date '+%Y-%m-%d %H:%M:%S')
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+
+    root  $root;
+    index index.php index.html;
+
+    access_log $access_log combined buffer=16k;
+    error_log  $error_log warn;
+
+    client_max_body_size 64m;
+
+    include $NGINX_SNIPPETS_DIR/security-headers.conf;
+    include $NGINX_SNIPPETS_DIR/deny-dotfiles.conf;
+
+    # Main location
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    # PHP-FPM
+    location ~ \.php$ {
+        try_files \$uri =404;
+        fastcgi_pass unix:$sock;
+        include $NGINX_SNIPPETS_DIR/fastcgi-php.conf;
+    }
+
+    include $NGINX_SNIPPETS_DIR/static-cache.conf;
+
+    # Block sensitive files
+    location ~* \.(env|log|sh|sql|bak|conf)$ {
+        deny all;
+    }
+}
+EOF
+}
+
+################################################################################
+# Template: Reverse Proxy vhost
+################################################################################
+
+generate_proxy_vhost() {
+    local username="$1" domain="$2" upstream="$3"
+    local access_log="/var/log/nginx/${domain}.access.log"
+    local error_log="/var/log/nginx/${domain}.error.log"
+
+    # Parse upstream scheme
+    local upstream_scheme="http"
+    [[ "$upstream" =~ ^https:// ]] && upstream_scheme="https"
+
+    cat << EOF
+# Vapor CP — Reverse Proxy vhost
+# User     : $username
+# Domain   : $domain
+# Upstream : $upstream
+# Created  : $(date '+%Y-%m-%d %H:%M:%S')
+
+upstream ${domain//./_}_backend {
+    server $upstream;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+
+    access_log $access_log combined buffer=16k;
+    error_log  $error_log warn;
+
+    client_max_body_size 64m;
+
+    include $NGINX_SNIPPETS_DIR/security-headers.conf;
+    include $NGINX_SNIPPETS_DIR/deny-dotfiles.conf;
+
+    # Proxy
+    location / {
+        proxy_pass         $upstream_scheme://${domain//./_}_backend;
+        proxy_http_version 1.1;
+
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   Upgrade           \$http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        proxy_buffering       on;
+        proxy_buffer_size     16k;
+        proxy_buffers         4 32k;
+
+        # Hide upstream headers
+        proxy_hide_header     X-Powered-By;
+        proxy_hide_header     Server;
+    }
+}
+EOF
+}
+
+################################################################################
+# Template: Static vhost
+################################################################################
+
+generate_static_vhost() {
+    local username="$1" domain="$2"
+    local root="$VAPOR_HOME/$username/public_html"
+    local access_log="/var/log/nginx/${domain}.access.log"
+    local error_log="/var/log/nginx/${domain}.error.log"
+
+    cat << EOF
+# Vapor CP — Static vhost
+# User   : $username
+# Domain : $domain
+# Created: $(date '+%Y-%m-%d %H:%M:%S')
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+
+    root  $root;
+    index index.html;
+
+    access_log $access_log combined buffer=16k;
+    error_log  $error_log warn;
+
+    include $NGINX_SNIPPETS_DIR/security-headers.conf;
+    include $NGINX_SNIPPETS_DIR/deny-dotfiles.conf;
+    include $NGINX_SNIPPETS_DIR/static-cache.conf;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    error_page 404 /404.html;
+    error_page 500 502 503 504 /50x.html;
+}
+EOF
+}
+
+################################################################################
+# Template: SSL server block (appended after certbot)
+################################################################################
+
+generate_ssl_block() {
+    local username="$1" domain="$2" type="$3" extra="$4"
+    local cert_path="/etc/letsencrypt/live/$domain"
+
+    cat << EOF
+
+# SSL — auto-added by v-set-nginx
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2  on;
+    server_name $domain www.$domain;
+
+    ssl_certificate     $cert_path/fullchain.pem;
+    ssl_certificate_key $cert_path/privkey.pem;
+    ssl_trusted_certificate $cert_path/chain.pem;
+
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_tickets off;
+    ssl_stapling        on;
+    ssl_stapling_verify on;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    include $NGINX_SNIPPETS_DIR/security-headers.conf;
+    include $NGINX_SNIPPETS_DIR/deny-dotfiles.conf;
+
+    # Redirect http block will be replaced with 301
+EOF
+
+    case "$type" in
+        php)
+            local php_ver="$extra"
+            local root="$VAPOR_HOME/$username/public_html"
+            local sock="/run/php/php${php_ver}-fpm.sock"
+            cat << EOF
+    root  $root;
+    index index.php index.html;
+    client_max_body_size 64m;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+    location ~ \.php$ {
+        try_files \$uri =404;
+        fastcgi_pass unix:$sock;
+        include $NGINX_SNIPPETS_DIR/fastcgi-php.conf;
+    }
+    include $NGINX_SNIPPETS_DIR/static-cache.conf;
+    location ~* \.(env|log|sh|sql|bak|conf)$ { deny all; }
+}
+EOF
+            ;;
+        proxy)
+            local upstream="$extra"
+            local upstream_scheme="http"
+            [[ "$upstream" =~ ^https:// ]] && upstream_scheme="https"
+            cat << EOF
+    client_max_body_size 64m;
+
+    location / {
+        proxy_pass         $upstream_scheme://${domain//./_}_backend;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   Upgrade           \$http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_read_timeout 60s;
+        proxy_hide_header  X-Powered-By;
+        proxy_hide_header  Server;
+    }
+}
+EOF
+            ;;
+        static)
+            cat << EOF
+    root  $VAPOR_HOME/$username/public_html;
+    index index.html;
+
+    location / { try_files \$uri \$uri/ =404; }
+    include $NGINX_SNIPPETS_DIR/static-cache.conf;
+    error_page 404 /404.html;
+}
+EOF
+            ;;
+    esac
+}
+
+################################################################################
+# CREATE
+################################################################################
+
+create_vhost() {
+    local username="$1"
+    local domain="$2"
+    local type="${3:-php}"
+    local extra="${4:-}"   # php version OR upstream URL
+
+    validate_domain "$domain"
+    validate_type "$type"
+
+    local conf_file
+    conf_file=$(site_conf "$domain")
+
+    [[ -f "$conf_file" ]] && error "Config for '$domain' already exists: $conf_file"
+
+    # Ensure snippets exist
+    [[ ! -d "$NGINX_SNIPPETS_DIR" ]] && create_snippets
+
+    # Ensure sites-available / sites-enabled exist
+    mkdir -p "$NGINX_SITES_AVAILABLE" "$NGINX_SITES_ENABLED"
+
+    echo "Creating Nginx vhost for '$domain' (type: $type)..."
+
+    case "$type" in
+        php)
+            local php_ver="${extra:-$DEFAULT_PHP_VERSION}"
+            validate_php_version "$php_ver"
+            generate_php_vhost "$username" "$domain" "$php_ver" > "$conf_file"
+            info "PHP-FPM vhost created (PHP $php_ver)"
+            ;;
+        proxy)
+            [[ -z "$extra" ]] && error "Upstream is required for proxy type. E.g.: 127.0.0.1:3000"
+            generate_proxy_vhost "$username" "$domain" "$extra" > "$conf_file"
+            info "Reverse proxy vhost created (upstream: $extra)"
+            ;;
+        static)
+            generate_static_vhost "$username" "$domain" > "$conf_file"
+            info "Static vhost created"
+            ;;
+    esac
+
+    # Save Vapor CP metadata
+    _save_vhost_meta "$username" "$domain" "$type" "$extra"
+
+    # Symlink to enable
+    ln -sf "$conf_file" "$(site_enabled "$domain")"
+    info "Site enabled (symlink created)"
+
+    nginx_reload
+
+    log_event "$username" "INFO" "vhost created domain=$domain type=$type"
+
+    print_separator
+    echo "  Domain  : $domain"
+    echo "  Type    : $type"
+    echo "  Config  : $conf_file"
+    [[ "$type" == "php" ]]   && echo "  PHP     : ${extra:-$DEFAULT_PHP_VERSION}"
+    [[ "$type" == "proxy" ]] && echo "  Upstream: $extra"
+    echo ""
+    echo "  Next steps:"
+    echo "    → Add SSL:   $SCRIPT_NAME ssl $username $domain"
+    echo "    → View logs: tail -f /var/log/nginx/$domain.error.log"
+    print_separator
+}
+
+_save_vhost_meta() {
+    local username="$1" domain="$2" type="$3" extra="$4"
+    local conf_dir="$VAPOR_HOME/$username/conf"
+    [[ ! -d "$conf_dir" ]] && return
+    local meta="$conf_dir/nginx_${domain}.conf"
+    cat > "$meta" << EOF
+# Vapor CP Nginx Metadata
+DOMAIN='$domain'
+TYPE='$type'
+EXTRA='$extra'
+CREATED='$(date '+%Y-%m-%d %H:%M:%S')'
+CONF_FILE='$(site_conf "$domain")'
+SSL='no'
+EOF
+    chmod 600 "$meta"
+    chown "$username":"$username" "$meta" 2>/dev/null || true
+}
+
+################################################################################
+# MODIFY
+################################################################################
+
+modify_vhost() {
+    local username="$1"
+    local domain="$2"
+
+    validate_domain "$domain"
+    local conf_file; conf_file=$(site_conf "$domain")
+    [[ ! -f "$conf_file" ]] && error "Config not found: $conf_file"
+
+    echo "Modifying vhost '$domain'..."
+    echo ""
+    echo "  1) Change PHP version"
+    echo "  2) Change upstream (proxy)"
+    echo "  3) Change document root"
+    echo "  4) Set custom client_max_body_size"
+    echo "  5) Add/update server alias"
+    echo "  6) Enable/disable access log"
+    echo "  7) Add custom location block"
+    echo "  8) Recreate vhost from scratch"
+    echo -n "Choice [1-8]: "
+    read -r choice
+
+    case "$choice" in
+        1) _modify_php_version "$domain" "$conf_file" ;;
+        2) _modify_upstream "$domain" "$conf_file" ;;
+        3) _modify_docroot "$domain" "$conf_file" ;;
+        4) _modify_body_size "$domain" "$conf_file" ;;
+        5) _modify_alias "$domain" "$conf_file" ;;
+        6) _toggle_access_log "$domain" "$conf_file" ;;
+        7) _add_location "$domain" "$conf_file" ;;
+        8)
+            echo -n "Type [php/proxy/static]: "; read -r newtype
+            echo -n "Extra (PHP version or upstream): "; read -r newextra
+            rm -f "$conf_file"
+            create_vhost "$username" "$domain" "$newtype" "$newextra"
+            return
+            ;;
+        *) error "Invalid choice." ;;
+    esac
+
+    nginx_reload
+    log_event "$username" "INFO" "vhost modified domain=$domain choice=$choice"
+    info "Vhost '$domain' updated successfully"
+}
+
+_modify_php_version() {
+    local domain="$1" conf_file="$2"
+    echo -n "New PHP version (e.g. 8.3): "; read -r new_ver
+    validate_php_version "$new_ver"
+    local new_sock="/run/php/php${new_ver}-fpm.sock"
+    sed -i "s|fastcgi_pass unix:/run/php/php[0-9.]*-fpm.sock;|fastcgi_pass unix:$new_sock;|g" "$conf_file"
+    info "PHP version updated to $new_ver"
+}
+
+_modify_upstream() {
+    local domain="$1" conf_file="$2"
+    echo -n "New upstream (e.g. 127.0.0.1:3001): "; read -r new_up
+    # Replace in upstream block and proxy_pass lines
+    local old_up
+    old_up=$(grep -oP 'server \K[^;]+' "$conf_file" | head -1 || true)
+    sed -i "s|server $old_up;|server $new_up;|g" "$conf_file"
+    info "Upstream updated to $new_up"
+}
+
+_modify_docroot() {
+    local domain="$1" conf_file="$2"
+    echo -n "New document root (absolute path): "; read -r new_root
+    [[ ! -d "$new_root" ]] && warning "Directory '$new_root' does not exist yet."
+    sed -i "s|root  .*|root  $new_root;|g" "$conf_file"
+    info "Document root updated to $new_root"
+}
+
+_modify_body_size() {
+    local domain="$1" conf_file="$2"
+    echo -n "New client_max_body_size (e.g. 128m): "; read -r new_size
+    [[ ! "$new_size" =~ ^[0-9]+(m|k|g|M|K|G)$ ]] && error "Invalid size format. Use e.g. 64m"
+    sed -i "s|client_max_body_size .*|client_max_body_size $new_size;|g" "$conf_file"
+    info "client_max_body_size set to $new_size"
+}
+
+_modify_alias() {
+    local domain="$1" conf_file="$2"
+    echo -n "Additional server alias (e.g. alias.example.com): "; read -r alias
+    validate_domain "$alias"
+    sed -i "s|server_name $domain www.$domain;|server_name $domain www.$domain $alias;|g" "$conf_file"
+    info "Alias '$alias' added"
+}
+
+_toggle_access_log() {
+    local domain="$1" conf_file="$2"
+    if grep -q "access_log.*combined" "$conf_file"; then
+        sed -i "s|access_log .* combined.*|access_log off;|g" "$conf_file"
+        info "Access log disabled"
+    else
+        sed -i "s|access_log off;|access_log /var/log/nginx/$domain.access.log combined buffer=16k;|g" "$conf_file"
+        info "Access log enabled"
+    fi
+}
+
+_add_location() {
+    local domain="$1" conf_file="$2"
+    echo -n "Location path (e.g. /api): "; read -r loc_path
+    echo "Enter location block content (end with a blank line):"
+    local loc_content=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && break
+        loc_content+="        $line"$'\n'
+    done
+    # Insert before last closing brace
+    local block
+    block=$(printf '\n    location %s {\n%s    }\n' "$loc_path" "$loc_content")
+    sed -i "$ s|}|$block\n}|" "$conf_file"
+    info "Location '$loc_path' added"
+}
+
+################################################################################
+# SSL
+################################################################################
+
+setup_ssl() {
+    local username="$1"
+    local domain="$2"
+    local email="${3:-}"
+
+    validate_domain "$domain"
+    command -v certbot &>/dev/null || error "certbot is not installed."
+
+    local conf_file; conf_file=$(site_conf "$domain")
+    [[ ! -f "$conf_file" ]] && error "No vhost config found for '$domain'. Create it first."
+
+    # Read metadata to know type+extra
+    local meta="$VAPOR_HOME/$username/conf/nginx_${domain}.conf"
+    local vhost_type="php" vhost_extra="$DEFAULT_PHP_VERSION"
+    if [[ -f "$meta" ]]; then
+        # shellcheck source=/dev/null
+        source "$meta"
+        vhost_type="$TYPE"
+        vhost_extra="$EXTRA"
+    fi
+
+    [[ -z "$email" ]] && { echo -n "Email for Let's Encrypt notifications: "; read -r email; }
+
+    echo "Requesting SSL certificate for '$domain' and 'www.$domain'..."
+
+    certbot certonly \
+        --webroot -w "$VAPOR_HOME/$username/public_html" \
+        -d "$domain" -d "www.$domain" \
+        --email "$email" \
+        --agree-tos --non-interactive --quiet \
+        || error "certbot failed. Check certbot logs."
+
+    info "Certificate obtained"
+
+    # Add HTTP → HTTPS redirect to existing HTTP block
+    sed -i '/server_name/a\    return 301 https://$host$request_uri;' "$conf_file"
+    # Remove other content from HTTP block to keep it clean
+    # (simple approach: rewrite the HTTP block to just the redirect)
+
+    # Append SSL server block
+    generate_ssl_block "$username" "$domain" "$vhost_type" "$vhost_extra" >> "$conf_file"
+
+    # Update metadata
+    [[ -f "$meta" ]] && sed -i "s/SSL='no'/SSL='yes'/" "$meta"
+
+    nginx_reload
+
+    log_event "$username" "INFO" "SSL enabled domain=$domain"
+    print_separator
+    info "SSL enabled for $domain"
+    echo "  Certificate : /etc/letsencrypt/live/$domain/fullchain.pem"
+    echo "  Auto-renew  : certbot renews automatically via systemd timer"
+    print_separator
+}
+
+################################################################################
+# ENABLE / DISABLE
+################################################################################
+
+enable_vhost() {
+    local username="$1" domain="$2"
+    validate_domain "$domain"
+    local conf; conf=$(site_conf "$domain")
+    [[ ! -f "$conf" ]] && error "Config not found: $conf"
+    [[ -L "$(site_enabled "$domain")" ]] && { warning "'$domain' is already enabled."; exit 0; }
+    ln -sf "$conf" "$(site_enabled "$domain")"
+    nginx_reload
+    log_event "$username" "INFO" "vhost enabled domain=$domain"
+    info "Site '$domain' enabled"
+}
+
+disable_vhost() {
+    local username="$1" domain="$2"
+    validate_domain "$domain"
+    local enabled; enabled=$(site_enabled "$domain")
+    [[ ! -L "$enabled" ]] && { warning "'$domain' is not enabled."; exit 0; }
+    rm -f "$enabled"
+    nginx_reload
+    log_event "$username" "INFO" "vhost disabled domain=$domain"
+    info "Site '$domain' disabled (config preserved)"
+}
+
+################################################################################
+# DELETE
+################################################################################
+
+delete_vhost() {
+    local username="$1" domain="$2"
+    validate_domain "$domain"
+
+    local conf; conf=$(site_conf "$domain")
+    [[ ! -f "$conf" ]] && error "Config not found for '$domain'."
+
+    echo "WARNING: You are about to delete the Nginx vhost for '$domain'."
+    echo "  Config  : $conf"
+    echo "  SSL cert will NOT be revoked automatically."
+    echo ""
+    read -p "Are you sure? (yes/no): " -r confirm
+    [[ "$confirm" != "yes" ]] && echo "Cancelled." && exit 0
+
+    rm -f "$(site_enabled "$domain")"
+    rm -f "$conf"
+    rm -f "$VAPOR_HOME/$username/conf/nginx_${domain}.conf" 2>/dev/null || true
+
+    nginx_reload
+    log_event "$username" "INFO" "vhost deleted domain=$domain"
+    info "Vhost '$domain' deleted"
+}
+
+################################################################################
+# LIST
+################################################################################
+
+list_vhosts() {
+    local filter="${1:-}"
+    echo ""
+    echo "Nginx Virtual Hosts:"
+    print_separator
+    printf "%-35s %-10s %-8s %-8s\n" "DOMAIN" "TYPE" "SSL" "STATUS"
+    print_separator
+
+    for conf in "$NGINX_SITES_AVAILABLE"/*.conf; do
+        [[ ! -f "$conf" ]] && continue
+        local domain; domain=$(basename "$conf" .conf)
+        [[ -n "$filter" ]] && [[ "$domain" != *"$filter"* ]] && continue
+
+        local type="unknown"
+        grep -q "fastcgi_pass" "$conf"  && type="php"
+        grep -q "proxy_pass"  "$conf"   && type="proxy"
+        grep -q "fastcgi_pass\|proxy_pass" "$conf" || type="static"
+
+        local ssl="no"
+        grep -q "ssl_certificate" "$conf" && ssl="yes"
+
+        local status="disabled"
+        [[ -L "$(site_enabled "$domain")" ]] && status="enabled"
+
+        printf "%-35s %-10s %-8s %-8s\n" "$domain" "$type" "$ssl" "$status"
+    done
+    echo ""
+}
+
+################################################################################
+# INFO
+################################################################################
+
+info_vhost() {
+    local username="$1" domain="$2"
+    validate_domain "$domain"
+
+    local conf; conf=$(site_conf "$domain")
+    [[ ! -f "$conf" ]] && error "Config not found for '$domain'."
+
+    local meta="$VAPOR_HOME/$username/conf/nginx_${domain}.conf"
+
+    echo ""
+    echo "Vhost Info: $domain"
+    print_separator
+
+    if [[ -f "$meta" ]]; then
+        # shellcheck source=/dev/null
+        source "$meta"
+        echo "  Domain   : $DOMAIN"
+        echo "  Type     : $TYPE"
+        echo "  Extra    : ${EXTRA:-—}"
+        echo "  SSL      : $SSL"
+        echo "  Created  : $CREATED"
+        echo "  Config   : $CONF_FILE"
+    fi
+
+    local enabled_sym; enabled_sym=$(site_enabled "$domain")
+    echo "  Enabled  : $([[ -L "$enabled_sym" ]] && echo yes || echo no)"
+    echo ""
+    echo "  PHP-FPM socket:"
+    grep -oP 'fastcgi_pass unix:\K[^;]+' "$conf" 2>/dev/null | sed 's/^/    /' || echo "    —"
+    echo ""
+    echo "  Upstream:"
+    grep -oP 'server \K[^;]+(?=;)' "$conf" 2>/dev/null | head -1 | sed 's/^/    /' || echo "    —"
+    echo ""
+    echo "  Server names:"
+    grep -oP 'server_name \K[^;]+' "$conf" 2>/dev/null | sed 's/^/    /'
+    echo ""
+    echo "  SSL certificate:"
+    grep -oP 'ssl_certificate \K[^;]+' "$conf" 2>/dev/null | head -1 | sed 's/^/    /' || echo "    —"
+    echo ""
+    echo "  Log files:"
+    echo "    /var/log/nginx/$domain.access.log"
+    echo "    /var/log/nginx/$domain.error.log"
+    print_separator
+}
+
+################################################################################
+# Usage
+################################################################################
+
+show_usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME ACTION USERNAME DOMAIN [OPTIONS]
+
+Manage Nginx virtual hosts for Vapor CP.
+Supports PHP-FPM, Reverse Proxy, and Static site configurations.
+
+Actions:
+    create    Create a new virtual host
+    modify    Interactively modify an existing vhost
+    delete    Delete a vhost
+    enable    Enable a disabled vhost
+    disable   Disable a vhost (keeps config)
+    ssl       Obtain Let's Encrypt SSL and configure HTTPS
+    list      List all vhosts
+    info      Show details for a specific vhost
+
+Create:
+    $SCRIPT_NAME create USERNAME DOMAIN [TYPE] [EXTRA]
+
+    TYPE      php (default) | proxy | static
+    EXTRA     PHP version (e.g. 8.2) for php type
+              Upstream addr (e.g. 127.0.0.1:3000) for proxy type
+
+SSL:
+    $SCRIPT_NAME ssl USERNAME DOMAIN [EMAIL]
+    Obtains a Let's Encrypt certificate via certbot (webroot method),
+    adds an HTTPS server block, and sets up HTTP→HTTPS redirect.
+
+List:
+    $SCRIPT_NAME list [FILTER]
+
+Examples:
+    # PHP-FPM site with default PHP version
+    $SCRIPT_NAME create myuser example.com
+
+    # PHP-FPM site with PHP 8.3
+    $SCRIPT_NAME create myuser example.com php 8.3
+
+    # Reverse proxy to Node.js app on port 3000
+    $SCRIPT_NAME create myuser app.example.com proxy 127.0.0.1:3000
+
+    # Static HTML site
+    $SCRIPT_NAME create myuser static.example.com static
+
+    # Enable SSL
+    $SCRIPT_NAME ssl myuser example.com admin@example.com
+
+    # Disable site temporarily
+    $SCRIPT_NAME disable myuser example.com
+
+    # Re-enable site
+    $SCRIPT_NAME enable myuser example.com
+
+    # Modify interactively
+    $SCRIPT_NAME modify myuser example.com
+
+    # Delete vhost
+    $SCRIPT_NAME delete myuser example.com
+
+    # List all vhosts
+    $SCRIPT_NAME list
+
+    # Filter list
+    $SCRIPT_NAME list example
+
+Environment variables:
+    NGINX_BIN          Path to nginx binary   (default: /usr/sbin/nginx)
+    NGINX_CONF_DIR     Nginx config directory  (default: /etc/nginx)
+    DEFAULT_PHP_VERSION Default PHP version    (default: 8.2)
+
+Version: $VERSION
+EOF
+}
+
+################################################################################
+# Main
+################################################################################
+
+main() {
+    if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+
+    check_root
+    check_dependencies
+
+    local action="${1,,}"; shift
+    validate_action "$action"
+
+    # list does not need username/domain
+    if [[ "$action" == "list" ]]; then
+        list_vhosts "${1:-}"
+        exit 0
+    fi
+
+    [[ $# -eq 0 ]] && error "USERNAME is required."
+    local username="$1"; shift
+    validate_username "$username"
+
+    # ssl, enable, disable, delete, info, modify, create all need domain
+    [[ $# -eq 0 ]] && error "DOMAIN is required."
+    local domain="$1"; shift
+
+    case "$action" in
+        create)  create_vhost  "$username" "$domain" "${1:-php}" "${2:-}" ;;
+        modify)  modify_vhost  "$username" "$domain" ;;
+        delete)  delete_vhost  "$username" "$domain" ;;
+        enable)  enable_vhost  "$username" "$domain" ;;
+        disable) disable_vhost "$username" "$domain" ;;
+        ssl)     setup_ssl     "$username" "$domain" "${1:-}" ;;
+        info)    info_vhost    "$username" "$domain" ;;
+    esac
+
+    exit 0
+}
+
+main "$@"
