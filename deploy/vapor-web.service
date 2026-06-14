@@ -1,0 +1,33 @@
+# Vapor - unit del web server della dashboard.
+# Procedura di deploy completa e variabili d'ambiente: vedi HOWTO.md.
+[Unit]
+Description=Vapor - web server dashboard (PHP built-in, per setup semplici)
+After=network.target incus.service
+Wants=incus.service
+
+# NOTA: il server PHP integrato va bene per piccoli setup interni. Per
+# produzione preferisci nginx + php-fpm (vedi deploy/nginx.conf.example);
+# in quel caso disabilita questa unit.
+
+[Service]
+Type=simple
+User=vapor
+Group=incus-admin
+WorkingDirectory=/opt/vapor
+ExecStart=/usr/bin/php -S 127.0.0.1:8080 -t /opt/vapor/public
+Restart=on-failure
+RestartSec=2
+
+Environment=INCUS_SOCKET=/var/lib/incus/unix.socket
+Environment=INCUS_PROJECT=default
+Environment=VAPOR_WS_URL=ws://127.0.0.1:8090
+Environment=VAPOR_SECRET=CAMBIAMI-con-un-valore-casuale-lungo
+Environment=VAPOR_DB=/opt/vapor/storage/vapor.sqlite
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,35 @@
+# Vapor - unit del server WebSocket del terminale.
+# Procedura di deploy completa e variabili d'ambiente: vedi HOWTO.md.
+[Unit]
+Description=Vapor - server WebSocket terminale PTY per Incus
+After=network.target incus.service
+Wants=incus.service
+
+[Service]
+Type=simple
+# Utente con accesso al socket di Incus (gruppo incus-admin).
+User=vapor
+Group=incus-admin
+WorkingDirectory=/opt/vapor
+ExecStart=/usr/bin/php /opt/vapor/bin/terminal-server.php
+Restart=on-failure
+RestartSec=2
+
+# Variabili d'ambiente (adatta ai tuoi valori).
+Environment=INCUS_SOCKET=/var/lib/incus/unix.socket
+Environment=INCUS_PROJECT=default
+Environment=VAPOR_WS_HOST=127.0.0.1
+Environment=VAPOR_WS_PORT=8090
+# Origin consentite per il WebSocket (anti CSWSH). Imposta l'host reale.
+Environment=VAPOR_WS_ORIGINS=https://vapor.example.com
+Environment=VAPOR_SECRET=CAMBIAMI-con-un-valore-casuale-lungo
+Environment=VAPOR_DB=/opt/vapor/storage/vapor.sqlite
+
+# Hardening di base.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

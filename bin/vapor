@@ -1,0 +1,184 @@
+#!/usr/bin/env php
+<?php
+/**
+ * CLI di amministrazione di Vapor.
+ *
+ *   php bin/vapor user:add <username> [password]
+ *   php bin/vapor user:del <username>
+ *   php bin/vapor user:list
+ *
+ * Se la password è omessa in user:add viene chiesta in modo interattivo
+ * (senza echo dove possibile).
+ */
+require __DIR__ . '/../app/autoload.php';
+
+use Vapor\Auth\Auth;
+use Vapor\Incus\IncusClient;
+use Vapor\Incus\CertService;
+
+$config = require __DIR__ . '/../config/config.php';
+$auth   = new Auth($config['auth']);
+
+/** Percorsi di default del certificato client (da config o storage/certs). */
+function cert_paths(array $config): array
+{
+    $cert = $config['incus']['client_cert'] ?: __DIR__ . '/../storage/certs/client.crt';
+    $key  = $config['incus']['client_key']  ?: __DIR__ . '/../storage/certs/client.key';
+    return [$cert, $key];
+}
+
+/** Estrae il valore di un flag --nome=valore dagli argomenti. */
+function opt(array $argv, string $name, ?string $default = null): ?string
+{
+    foreach ($argv as $a) {
+        if (str_starts_with($a, "--$name=")) {
+            return substr($a, strlen($name) + 3);
+        }
+    }
+    return $default;
+}
+
+$cmd = $argv[1] ?? '';
+
+switch ($cmd) {
+    case 'user:add':
+        // Flag --admin in qualsiasi posizione.
+        $args  = array_slice($argv, 2);
+        $admin = in_array('--admin', $args, true);
+        $args  = array_values(array_filter($args, fn($a) => $a !== '--admin'));
+        $username = $args[0] ?? '';
+        if ($username === '') {
+            fwrite(STDERR, "Uso: php bin/vapor user:add <username> [password] [--admin]\n");
+            exit(1);
+        }
+        $password = $args[1] ?? prompt_password('Password per ' . $username . ': ');
+        if (strlen($password) < 8) {
+            fwrite(STDERR, "La password deve avere almeno 8 caratteri.\n");
+            exit(1);
+        }
+        $auth->createUser($username, $password, $admin ? 'admin' : 'user');
+        echo "Utente '$username' creato/aggiornato" . ($admin ? ' (admin)' : '') . ".\n";
+        break;
+
+    case 'user:role':
+        $username = $argv[2] ?? '';
+        $role     = $argv[3] ?? '';
+        if ($username === '' || !in_array($role, ['admin', 'user'], true)) {
+            fwrite(STDERR, "Uso: php bin/vapor user:role <username> <admin|user>\n");
+            exit(1);
+        }
+        echo $auth->setRole($username, $role)
+            ? "Ruolo di '$username' impostato a '$role'.\n"
+            : "Utente '$username' non trovato.\n";
+        break;
+
+    case 'user:del':
+        $username = $argv[2] ?? '';
+        if ($username === '') {
+            fwrite(STDERR, "Uso: php bin/vapor user:del <username>\n");
+            exit(1);
+        }
+        echo $auth->deleteUser($username)
+            ? "Utente '$username' eliminato.\n"
+            : "Utente '$username' non trovato.\n";
+        break;
+
+    case 'user:list':
+        $users = $auth->listUsers();
+        if (!$users) {
+            echo "Nessun utente. Creane uno con: php bin/vapor user:add <username> --admin\n";
+            break;
+        }
+        printf("%-24s %-8s %s\n", 'USERNAME', 'RUOLO', 'CREATO');
+        foreach ($users as $u) {
+            printf("%-24s %-8s %s\n", $u['username'], $u['role'] ?? 'user', $u['created_at']);
+        }
+        break;
+
+    case 'cert:generate':
+        [$certPath, $keyPath] = cert_paths($config);
+        $cn   = opt($argv, 'cn', 'vapor');
+        $days = (int)(opt($argv, 'days', '3650'));
+        try {
+            $svc = new CertService(new IncusClient($config['incus']));
+            $res = $svc->generate($cn, $days, $certPath, $keyPath);
+        } catch (\Throwable $e) {
+            fwrite(STDERR, 'Errore: ' . $e->getMessage() . "\n");
+            exit(1);
+        }
+        echo "Certificato client generato:\n";
+        echo "  cert:        {$res['cert']}\n";
+        echo "  key:         {$res['key']}\n";
+        echo "  fingerprint: {$res['fingerprint']}\n\n";
+        echo "Imposta in ambiente:\n";
+        echo "  INCUS_CLIENT_CERT={$res['cert']}\n";
+        echo "  INCUS_CLIENT_KEY={$res['key']}\n";
+        echo "  INCUS_HTTPS=https://<host>:8443\n\n";
+        echo "Poi installalo nel trust store: php bin/vapor cert:install\n";
+        break;
+
+    case 'cert:install':
+        [$certPath] = cert_paths($config);
+        $name  = opt($argv, 'name', 'vapor');
+        $token = opt($argv, 'token');   // registrazione remota con trust token
+        try {
+            $svc = new CertService(new IncusClient($config['incus']));
+            $res = $svc->install($certPath, $name, $token);
+        } catch (\Throwable $e) {
+            fwrite(STDERR, 'Errore: ' . $e->getMessage() . "\n");
+            fwrite(STDERR, "Suggerimento: l'installazione via API richiede accesso admin a Incus\n");
+            fwrite(STDERR, "(socket Unix locale). In alternativa, da remoto:\n");
+            fwrite(STDERR, "  incus config trust add-certificate $certPath\n");
+            exit(1);
+        }
+        echo "Certificato '{$res['name']}' installato nel trust store di Incus.\n";
+        echo "  fingerprint: {$res['fingerprint']}\n";
+        break;
+
+    case 'cert:setup':
+        // Genera e installa in un colpo solo.
+        [$certPath, $keyPath] = cert_paths($config);
+        $cn    = opt($argv, 'cn', 'vapor');
+        $days  = (int)(opt($argv, 'days', '3650'));
+        $name  = opt($argv, 'name', 'vapor');
+        $token = opt($argv, 'token');
+        try {
+            $svc = new CertService(new IncusClient($config['incus']));
+            $res = $svc->generate($cn, $days, $certPath, $keyPath);
+            $svc->install($certPath, $name, $token);
+        } catch (\Throwable $e) {
+            fwrite(STDERR, 'Errore: ' . $e->getMessage() . "\n");
+            exit(1);
+        }
+        echo "Certificato generato e installato.\n";
+        echo "  cert:        {$res['cert']}\n";
+        echo "  key:         {$res['key']}\n";
+        echo "  fingerprint: {$res['fingerprint']}\n";
+        break;
+
+    default:
+        fwrite(STDERR, "Comandi disponibili:\n");
+        fwrite(STDERR, "  user:add <username> [password] [--admin]\n");
+        fwrite(STDERR, "  user:role <username> <admin|user>\n");
+        fwrite(STDERR, "  user:del <username>\n");
+        fwrite(STDERR, "  user:list\n");
+        fwrite(STDERR, "  cert:generate [--cn=vapor] [--days=3650]\n");
+        fwrite(STDERR, "  cert:install [--name=vapor] [--token=<trust-token>]\n");
+        fwrite(STDERR, "  cert:setup [--cn=vapor] [--days=3650] [--name=vapor] [--token=<trust-token>]\n");
+        exit(1);
+}
+
+/** Legge una password da stdin disattivando l'echo se il terminale lo permette. */
+function prompt_password(string $label): string
+{
+    fwrite(STDOUT, $label);
+    if (DIRECTORY_SEPARATOR === '/' && @shell_exec('command -v stty')) {
+        @shell_exec('stty -echo');
+        $pw = rtrim((string)fgets(STDIN), "\n");
+        @shell_exec('stty echo');
+        fwrite(STDOUT, "\n");
+    } else {
+        $pw = rtrim((string)fgets(STDIN), "\r\n");
+    }
+    return $pw;
+}

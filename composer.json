@@ -1,0 +1,20 @@
+{
+    "name": "ostap/vapor",
+    "description": "Vapor - dashboard PHP MVC per Incus/LXD (container CRUD, network forward, file manager, terminale PTY). Nessuna dipendenza esterna.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-sockets": "*",
+        "ext-pdo": "*",
+        "ext-pdo_sqlite": "*",
+        "ext-openssl": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Vapor\\": "app/"
+        }
+    }
+}
