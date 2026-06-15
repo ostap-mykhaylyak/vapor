@@ -28,6 +28,22 @@ Su Debian/Ubuntu: `sudo apt install php-cli php-curl php-sqlite3`.
 
 Tutta la configurazione passa per variabili d'ambiente (default in `config/config.php`).
 
+**Sorgente unica: il file `.env`.** Copia `.env.example` in `.env` alla radice del
+progetto: viene letto **sia dalla CLI/web** (automaticamente) **sia dai servizi
+systemd** (via `EnvironmentFile=/opt/vapor/.env`). Così non devi più esportare le
+variabili a mano nella shell prima di lanciare `bin/vapor`.
+
+```sh
+cp .env.example .env
+nano .env            # imposta almeno VAPOR_SECRET e, per HTTPS, INCUS_HTTPS + cert/key
+```
+
+**Precedenza:** il `.env` ha **priorità massima** e **sovrascrive** qualunque
+variabile d'ambiente già impostata (systemd, shell, inline). Ciò che non è nel
+`.env` resta com'è. È quindi la sorgente di verità: metti lì tutto.
+
+> Il file `.env` è escluso da git (contiene segreti). Versiona solo `.env.example`.
+
 | Variabile            | Default                              | Note |
 |----------------------|--------------------------------------|------|
 | `INCUS_SOCKET`       | `/var/lib/incus/unix.socket`         | Socket Unix locale |
@@ -109,15 +125,30 @@ Sull'host di Incus, un amministratore genera un token monouso:
 incus config trust add vapor        # stampa un trust token temporaneo
 ```
 
-Su Vapor (host remoto) genera il certificato e auto-registralo presentando il token
-(la connessione avviene già via HTTPS con il certificato appena creato):
+Su Vapor (host remoto): genera il certificato, **poi imposta l'endpoint HTTPS nel
+`.env`** (la registrazione col token avviene via HTTPS, non sul socket) e registrati.
 
 ```sh
 php bin/vapor cert:generate --cn=vapor
-php bin/vapor cert:install  --name=vapor --token=<trust-token>
-# oppure in un colpo solo:
-php bin/vapor cert:setup --token=<trust-token>
 ```
+
+Nel `.env` (così la CLI lo legge subito, senza export manuali):
+
+```sh
+INCUS_HTTPS=https://mio-host:8443
+INCUS_CLIENT_CERT=/opt/vapor/storage/certs/client.crt
+INCUS_CLIENT_KEY=/opt/vapor/storage/certs/client.key
+INCUS_VERIFY=false
+```
+
+Poi registra il certificato col token:
+
+```sh
+php bin/vapor cert:install --name=vapor --token=<trust-token>
+```
+
+> Se INCUS_HTTPS non è impostato, `cert:install --token` si ferma con un messaggio
+> esplicito (la registrazione con token richiede l'endpoint HTTPS).
 
 **Configurazione finale (B1 o B2)** — i percorsi sono quelli stampati dai comandi:
 

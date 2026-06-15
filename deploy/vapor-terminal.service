@@ -15,15 +15,9 @@ ExecStart=/usr/bin/php /opt/vapor/bin/terminal-server.php
 Restart=on-failure
 RestartSec=2
 
-# Variabili d'ambiente (adatta ai tuoi valori).
-Environment=INCUS_SOCKET=/var/lib/incus/unix.socket
-Environment=INCUS_PROJECT=default
-Environment=VAPOR_WS_HOST=127.0.0.1
-Environment=VAPOR_WS_PORT=8090
-# Origin consentite per il WebSocket (anti CSWSH). Imposta l'host reale.
-Environment=VAPOR_WS_ORIGINS=https://vapor.example.com
-Environment=VAPOR_SECRET=CAMBIAMI-con-un-valore-casuale-lungo
-Environment=VAPOR_DB=/opt/vapor/storage/vapor.sqlite
+# Configurazione: sorgente unica nel file .env (vedi .env.example).
+# Lo stesso file è letto anche dalla CLI e dal web server.
+EnvironmentFile=/opt/vapor/.env
 
 # Hardening di base.
 NoNewPrivileges=true

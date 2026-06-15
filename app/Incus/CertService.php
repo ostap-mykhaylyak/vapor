@@ -66,8 +66,27 @@ class CertService
     public function install(string $certPath, string $name, ?string $token = null): array
     {
         if (!is_file($certPath)) {
-            throw new \RuntimeException("Certificato non trovato: $certPath");
+            throw new \RuntimeException("Certificato non trovato: $certPath — esegui prima 'cert:generate'.");
         }
+
+        // Validazione del canale di registrazione in base alla modalità.
+        $cfg     = $this->incus->config();
+        $useHttps = !empty($cfg['https']);
+
+        if ($token !== null && $token !== '' && !$useHttps) {
+            throw new \RuntimeException(
+                "La registrazione con trust token avviene via HTTPS: imposta INCUS_HTTPS "
+                . "(e INCUS_CLIENT_CERT/INCUS_CLIENT_KEY) prima di 'cert:install --token'."
+            );
+        }
+        if (!$useHttps && !@file_exists($cfg['socket'] ?? '')) {
+            throw new \RuntimeException(
+                "Socket Incus non trovato: " . ($cfg['socket'] ?? '?') . ". "
+                . "Verifica che Incus sia in esecuzione e il percorso (INCUS_SOCKET); "
+                . "se Vapor è su un host remoto usa la modalità HTTPS con trust token."
+            );
+        }
+
         $pem = (string)file_get_contents($certPath);
 
         // Il campo `certificate` dell'API è il corpo base64 (DER) del PEM,

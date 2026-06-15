@@ -71,12 +71,20 @@ class IncusClient
         if ($response === false) {
             $err = curl_error($ch);
             curl_close($ch);
-            throw new IncusException("Errore di connessione a Incus: $err");
+            throw new IncusException('Errore di connessione a Incus (' . $this->target() . "): $err");
         }
         $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
         return [$status, (string)$response];
+    }
+
+    /** Descrizione leggibile dell'endpoint, per i messaggi d'errore. */
+    private function target(): string
+    {
+        return !empty($this->cfg['https'])
+            ? 'HTTPS ' . $this->cfg['https']
+            : 'socket Unix ' . ($this->cfg['socket'] ?? '?');
     }
 
     /**
@@ -128,7 +136,7 @@ class IncusClient
         if ($body === false) {
             $err = curl_error($ch);
             curl_close($ch);
-            throw new IncusException("Errore di connessione a Incus: $err");
+            throw new IncusException('Errore di connessione a Incus (' . $this->target() . "): $err");
         }
         $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);

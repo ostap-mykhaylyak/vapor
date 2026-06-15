@@ -6,7 +6,13 @@
  * Tutti i parametri sono sovrascrivibili via variabili d'ambiente: l'elenco
  * completo e le procedure (installazione, certificati, avvio, deploy) sono in
  * HOWTO.md. Panoramica e modello di sicurezza in README.md.
+ *
+ * Sorgente unica con priorità massima: il file ".env" alla radice del progetto
+ * (vedi .env.example). Sovrascrive qualunque variabile d'ambiente già impostata
+ * (systemd, shell); ciò che non è nel .env resta invariato.
  */
+\Vapor\Core\Env::load(__DIR__ . '/../.env');
+
 return [
     // --- Connessione a Incus ---
     'incus' => [
