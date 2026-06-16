@@ -42,14 +42,7 @@ class IncusClient
         if (!empty($this->cfg['https'])) {
             // Endpoint HTTPS con certificato client.
             curl_setopt($ch, CURLOPT_URL, rtrim($this->cfg['https'], '/') . $url);
-            if (!empty($this->cfg['client_cert'])) {
-                curl_setopt($ch, CURLOPT_SSLCERT, $this->cfg['client_cert']);
-            }
-            if (!empty($this->cfg['client_key'])) {
-                curl_setopt($ch, CURLOPT_SSLKEY, $this->cfg['client_key']);
-            }
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, (bool)($this->cfg['verify'] ?? false));
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, ($this->cfg['verify'] ?? false) ? 2 : 0);
+            $this->applyTlsAuth($ch);
         } else {
             // Socket Unix locale. L'host nell'URL è arbitrario.
             curl_setopt($ch, CURLOPT_UNIX_SOCKET_PATH, $this->cfg['socket']);
@@ -88,6 +81,32 @@ class IncusClient
     }
 
     /**
+     * Imposta su un handle cURL il certificato client e le opzioni di verifica
+     * TLS. Con verifica attiva e un cert del server "pinnato" (cafile), valida
+     * la connessione contro quel certificato (utile per i self-signed di Incus)
+     * senza imporre il controllo dell'hostname.
+     *
+     * @param \CurlHandle $ch
+     */
+    private function applyTlsAuth($ch): void
+    {
+        $verify = (bool)($this->cfg['verify'] ?? false);
+        if (!empty($this->cfg['client_cert'])) {
+            curl_setopt($ch, CURLOPT_SSLCERT, $this->cfg['client_cert']);
+        }
+        if (!empty($this->cfg['client_key'])) {
+            curl_setopt($ch, CURLOPT_SSLKEY, $this->cfg['client_key']);
+        }
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, $verify);
+        if ($verify && !empty($this->cfg['cafile'])) {
+            curl_setopt($ch, CURLOPT_CAINFO, $this->cfg['cafile']);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0); // pinning: niente check hostname
+        } else {
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, $verify ? 2 : 0);
+        }
+    }
+
+    /**
      * Come raw() ma restituisce anche gli header della risposta.
      * Usato dal file manager per leggere X-Incus-type, mode, uid/gid.
      * Permette inoltre di inviare header custom (es. upload file).
@@ -104,10 +123,7 @@ class IncusClient
         $ch = curl_init();
         if (!empty($this->cfg['https'])) {
             curl_setopt($ch, CURLOPT_URL, rtrim($this->cfg['https'], '/') . $url);
-            if (!empty($this->cfg['client_cert'])) curl_setopt($ch, CURLOPT_SSLCERT, $this->cfg['client_cert']);
-            if (!empty($this->cfg['client_key']))  curl_setopt($ch, CURLOPT_SSLKEY, $this->cfg['client_key']);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, (bool)($this->cfg['verify'] ?? false));
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, ($this->cfg['verify'] ?? false) ? 2 : 0);
+            $this->applyTlsAuth($ch);
         } else {
             curl_setopt($ch, CURLOPT_UNIX_SOCKET_PATH, $this->cfg['socket']);
             curl_setopt($ch, CURLOPT_URL, 'http://incus' . $url);
@@ -161,10 +177,7 @@ class IncusClient
         $ch = curl_init();
         if (!empty($this->cfg['https'])) {
             curl_setopt($ch, CURLOPT_URL, rtrim($this->cfg['https'], '/') . $url);
-            if (!empty($this->cfg['client_cert'])) curl_setopt($ch, CURLOPT_SSLCERT, $this->cfg['client_cert']);
-            if (!empty($this->cfg['client_key']))  curl_setopt($ch, CURLOPT_SSLKEY, $this->cfg['client_key']);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, (bool)($this->cfg['verify'] ?? false));
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, ($this->cfg['verify'] ?? false) ? 2 : 0);
+            $this->applyTlsAuth($ch);
         } else {
             curl_setopt($ch, CURLOPT_UNIX_SOCKET_PATH, $this->cfg['socket']);
             curl_setopt($ch, CURLOPT_URL, 'http://incus' . $url);

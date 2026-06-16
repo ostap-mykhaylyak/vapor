@@ -114,6 +114,39 @@ class CertService
         ];
     }
 
+    /**
+     * Recupera il certificato TLS presentato dal server (PEM), per il
+     * "certificate pinning": permette la verifica TLS anche con cert
+     * self-signed di Incus, senza affidarsi alle CA di sistema.
+     */
+    public static function fetchServerCert(string $url): ?string
+    {
+        $host = parse_url($url, PHP_URL_HOST);
+        $port = parse_url($url, PHP_URL_PORT) ?: 8443;
+        if (!$host) {
+            return null;
+        }
+        $ctx = stream_context_create(['ssl' => [
+            'capture_peer_cert' => true,
+            'verify_peer'       => false,
+            'verify_peer_name'  => false,
+        ]]);
+        $client = @stream_socket_client(
+            "ssl://$host:$port", $errno, $errstr, 10, STREAM_CLIENT_CONNECT, $ctx
+        );
+        if (!$client) {
+            return null;
+        }
+        $params = stream_context_get_params($client);
+        $cert   = $params['options']['ssl']['peer_certificate'] ?? null;
+        fclose($client);
+
+        if (!$cert || !openssl_x509_export($cert, $pem)) {
+            return null;
+        }
+        return $pem;
+    }
+
     /** True se un certificato con quella fingerprint è già nel trust store. */
     public function isInstalled(string $fingerprint): bool
     {

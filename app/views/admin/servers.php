@@ -58,6 +58,11 @@
         <label>Project <input name="project" value="default"></label>
         <label>Trust token <input name="token" required placeholder="incolla il token"></label>
         <label class="check"><input type="checkbox" name="verify" value="1"> Verifica certificato TLS del server</label>
+        <p class="muted" style="grid-column:1/-1">
+            Con la verifica attiva, Vapor recupera e <strong>fissa</strong> (pinning) il
+            certificato del server: protegge dal MITM anche con certificati self-signed
+            di Incus. Il server dev'essere raggiungibile al momento dell'aggiunta.
+        </p>
         <div class="form-actions"><button class="btn primary">Aggiungi e registra</button></div>
     </form>
 </div>

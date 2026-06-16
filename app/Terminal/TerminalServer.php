@@ -288,13 +288,18 @@ class TerminalServer
         $path     = "/1.0/operations/$opId/websocket?secret=$secret";
 
         if ($useHttps) {
-            $base = preg_replace('#^https?://#', '', rtrim($cfg['https'], '/'));
-            $ctx  = stream_context_create(['ssl' => [
-                'verify_peer'      => (bool)($cfg['verify'] ?? false),
-                'verify_peer_name' => (bool)($cfg['verify'] ?? false),
+            $base   = preg_replace('#^https?://#', '', rtrim($cfg['https'], '/'));
+            $verify = (bool)($cfg['verify'] ?? false);
+            $ssl    = [
+                'verify_peer'      => $verify,
+                'verify_peer_name' => false,            // pinning: niente check hostname
                 'local_cert'       => $cfg['client_cert'] ?? null,
                 'local_pk'         => $cfg['client_key'] ?? null,
-            ]]);
+            ];
+            if ($verify && !empty($cfg['cafile'])) {
+                $ssl['cafile'] = $cfg['cafile'];        // cert del server pinnato
+            }
+            $ctx    = stream_context_create(['ssl' => $ssl]);
             $stream = @stream_socket_client("ssl://$base", $errno, $errstr, 5, STREAM_CLIENT_CONNECT, $ctx);
             $hostHeader = parse_url($cfg['https'], PHP_URL_HOST) ?: 'incus';
         } else {

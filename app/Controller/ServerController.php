@@ -60,16 +60,35 @@ class ServerController extends Controller
         }
 
         // Percorsi dei certificati del server.
-        $slug    = preg_replace('/[^a-zA-Z0-9._-]/', '_', $name);
-        $dir     = rtrim($this->config['storage'], '/\\') . '/certs/' . $slug;
+        $slug     = preg_replace('/[^a-zA-Z0-9._-]/', '_', $name);
+        $dir      = rtrim($this->config['storage'], '/\\') . '/certs/' . $slug;
         $certPath = $dir . '/client.crt';
         $keyPath  = $dir . '/client.key';
+        $caPath   = $dir . '/server.crt';
+        $url      = rtrim($url, '/');
+
+        // Con verifica TLS attiva: pinna il certificato presentato dal server
+        // (necessario per i cert self-signed di Incus).
+        $serverCert = null;
+        if ($verify) {
+            $pem = CertService::fetchServerCert($url);
+            if ($pem === null) {
+                return $this->serverNotice('Impossibile recuperare il certificato TLS del server: controlla URL/raggiungibilità, oppure disattiva "Verifica TLS".');
+            }
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0700, true);
+            }
+            file_put_contents($caPath, $pem);
+            @chmod($caPath, 0644);
+            $serverCert = $caPath;
+        }
 
         $clientCfg = [
-            'https'       => rtrim($url, '/'),
+            'https'       => $url,
             'client_cert' => $certPath,
             'client_key'  => $keyPath,
             'verify'      => $verify,
+            'cafile'      => $serverCert,
             'project'     => $project,
             'socket'      => null,
         ];
@@ -82,17 +101,19 @@ class ServerController extends Controller
             // Pulizia dei file generati se la registrazione fallisce.
             @unlink($certPath);
             @unlink($keyPath);
+            @unlink($caPath);
             @rmdir($dir);
             return $this->serverNotice('Registrazione fallita: ' . $e->getMessage());
         }
 
         $id = $repo->create([
-            'name'      => $name,
-            'url'       => rtrim($url, '/'),
-            'project'   => $project,
-            'verify'    => $verify,
-            'cert_path' => $certPath,
-            'key_path'  => $keyPath,
+            'name'        => $name,
+            'url'         => $url,
+            'project'     => $project,
+            'verify'      => $verify,
+            'cert_path'   => $certPath,
+            'key_path'    => $keyPath,
+            'server_cert' => $serverCert,
         ]);
         $this->audit('server.create', $name, $url);
 

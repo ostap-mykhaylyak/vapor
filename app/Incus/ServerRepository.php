@@ -28,17 +28,24 @@ class ServerRepository
         $db->exec('PRAGMA journal_mode=WAL');
         $db->exec(<<<SQL
             CREATE TABLE IF NOT EXISTS servers (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                name       TEXT NOT NULL UNIQUE,
-                url        TEXT NOT NULL,
-                project    TEXT NOT NULL DEFAULT 'default',
-                verify     INTEGER NOT NULL DEFAULT 0,
-                cert_path  TEXT NOT NULL,
-                key_path   TEXT NOT NULL,
-                is_default INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL UNIQUE,
+                url         TEXT NOT NULL,
+                project     TEXT NOT NULL DEFAULT 'default',
+                verify      INTEGER NOT NULL DEFAULT 0,
+                cert_path   TEXT NOT NULL,
+                key_path    TEXT NOT NULL,
+                server_cert TEXT,
+                is_default  INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
             )
         SQL);
+
+        // Migrazione idempotente per DB preesistenti.
+        $cols = $db->query('PRAGMA table_info(servers)')->fetchAll(\PDO::FETCH_COLUMN, 1);
+        if (!in_array('server_cert', $cols, true)) {
+            $db->exec('ALTER TABLE servers ADD COLUMN server_cert TEXT');
+        }
         return $db;
     }
 
@@ -86,14 +93,14 @@ class ServerRepository
     }
 
     /**
-     * @param array{name:string,url:string,project:string,verify:bool,cert_path:string,key_path:string} $data
+     * @param array{name:string,url:string,project:string,verify:bool,cert_path:string,key_path:string,server_cert?:?string} $data
      */
     public function create(array $data): int
     {
         $first = $this->count() === 0;
         $stmt  = $this->db->prepare(
-            'INSERT INTO servers (name, url, project, verify, cert_path, key_path, is_default)
-             VALUES (:name, :url, :project, :verify, :cert, :key, :def)'
+            'INSERT INTO servers (name, url, project, verify, cert_path, key_path, server_cert, is_default)
+             VALUES (:name, :url, :project, :verify, :cert, :key, :scert, :def)'
         );
         $stmt->execute([
             ':name'    => $data['name'],
@@ -102,6 +109,7 @@ class ServerRepository
             ':verify'  => !empty($data['verify']) ? 1 : 0,
             ':cert'    => $data['cert_path'],
             ':key'     => $data['key_path'],
+            ':scert'   => $data['server_cert'] ?? null,
             ':def'     => $first ? 1 : 0,   // il primo server diventa default
         ]);
         return (int)$this->db->lastInsertId();
@@ -130,6 +138,7 @@ class ServerRepository
             'client_cert' => $row['cert_path'],
             'client_key'  => $row['key_path'],
             'verify'      => (bool)$row['verify'],
+            'cafile'      => $row['server_cert'] ?? null,  // cert del server pinnato
             'project'     => $row['project'] ?? 'default',
             'socket'      => null,
         ];
