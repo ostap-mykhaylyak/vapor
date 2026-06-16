@@ -196,6 +196,78 @@ class IncusClient
     }
 
     /**
+     * Come headersOnly() ma per molte query in parallelo (curl_multi), per
+     * fare lo stat di tutte le voci di una directory senza N round-trip
+     * sequenziali. Le query differiscono solo per i parametri (es. 'path').
+     *
+     * @param array<int,array<string,string>> $queries
+     * @return array<int,array{status:int,headers:array<string,string>}> allineato a $queries
+     */
+    public function headersOnlyMulti(string $path, array $queries): array
+    {
+        $results = [];
+        // Limita la concorrenza per non scommergere il server Incus.
+        foreach (array_chunk($queries, 40, true) as $chunk) {
+            $mh      = curl_multi_init();
+            $handles = [];
+            $headers = [];
+
+            foreach ($chunk as $i => $query) {
+                if (!isset($query['project']) && !str_contains($path, 'project=')) {
+                    $query['project'] = $this->project;
+                }
+                $url = $path . (empty($query) ? '' : '?' . http_build_query($query));
+
+                $ch = curl_init();
+                if (!empty($this->cfg['https'])) {
+                    curl_setopt($ch, CURLOPT_URL, rtrim($this->cfg['https'], '/') . $url);
+                    if (!empty($this->cfg['client_cert'])) curl_setopt($ch, CURLOPT_SSLCERT, $this->cfg['client_cert']);
+                    if (!empty($this->cfg['client_key']))  curl_setopt($ch, CURLOPT_SSLKEY, $this->cfg['client_key']);
+                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, (bool)($this->cfg['verify'] ?? false));
+                    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, ($this->cfg['verify'] ?? false) ? 2 : 0);
+                } else {
+                    curl_setopt($ch, CURLOPT_UNIX_SOCKET_PATH, $this->cfg['socket']);
+                    curl_setopt($ch, CURLOPT_URL, 'http://incus' . $url);
+                }
+                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'GET');
+                curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+                $headers[$i] = [];
+                curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($c, $header) use (&$headers, $i) {
+                    $parts = explode(':', $header, 2);
+                    if (count($parts) === 2) {
+                        $headers[$i][strtolower(trim($parts[0]))] = trim($parts[1]);
+                    }
+                    return strlen($header);
+                });
+                curl_setopt($ch, CURLOPT_WRITEFUNCTION, fn($c, $data) => 0);
+
+                $handles[$i] = $ch;
+                curl_multi_add_handle($mh, $ch);
+            }
+
+            do {
+                $mrc = curl_multi_exec($mh, $running);
+                if ($running) {
+                    curl_multi_select($mh, 1.0);
+                }
+            } while ($running && $mrc === CURLM_OK);
+
+            foreach ($handles as $i => $ch) {
+                $results[$i] = [
+                    'status'  => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
+                    'headers' => $headers[$i] ?? [],
+                ];
+                curl_multi_remove_handle($mh, $ch);
+                curl_close($ch);
+            }
+            curl_multi_close($mh);
+        }
+
+        ksort($results);
+        return $results;
+    }
+
+    /**
      * Esegue una richiesta e decodifica l'envelope Incus.
      * Per le operations async attende il completamento se $wait è true.
      *

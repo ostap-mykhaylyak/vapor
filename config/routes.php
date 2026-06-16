@@ -31,7 +31,7 @@ return function (Router $r): void {
     $r->post('/admin/users/role',     [AdminController::class, 'setRole']);
     $r->post('/admin/users/password', [AdminController::class, 'resetPassword']);
     $r->post('/admin/users/delete',   [AdminController::class, 'deleteUser']);
-    $r->get('/admin/audit',           [AdminController::class, 'audit']);
+    $r->get('/admin/audit',           [AdminController::class, 'auditLog']);
 
     // Home -> elenco istanze.
     $r->get('/', [InstanceController::class, 'index']);

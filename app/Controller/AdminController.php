@@ -18,7 +18,7 @@ class AdminController extends Controller
     }
 
     /** Registro di audit (solo admin). */
-    public function audit(Request $request): Response
+    public function auditLog(Request $request): Response
     {
         $this->requireAdmin();
         $user   = trim((string)$request->input('user', ''));

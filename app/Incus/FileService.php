@@ -43,15 +43,21 @@ class FileService
 
         $data    = json_decode($body, true);
         $names   = $data['metadata'] ?? [];
-        $entries = [];
         $prefix  = rtrim($path, '/') . '/';
+
+        // Stat di tutte le voci in parallelo per ricavarne il tipo.
+        $queries = [];
         foreach ($names as $n) {
-            $childPath = $prefix . $n;
-            $entries[] = [
-                'name' => $n,
-                'path' => $childPath,
-                'type' => $this->statType($instance, $childPath),
-            ];
+            $queries[] = ['path' => $prefix . $n];
+        }
+        $stats = $queries
+            ? $this->incus->headersOnlyMulti($this->base($instance), $queries)
+            : [];
+
+        $entries = [];
+        foreach ($names as $i => $n) {
+            $type = ($stats[$i]['headers']['x-incus-type'] ?? null) ?: 'file';
+            $entries[] = ['name' => $n, 'path' => $prefix . $n, 'type' => $type];
         }
 
         // Ordine: prima le cartelle, poi alfabetico (case-insensitive).
@@ -65,22 +71,6 @@ class FileService
         });
 
         return ['type' => 'directory', 'entries' => $entries];
-    }
-
-    /**
-     * Tipo di una entry ("directory" | "file" | "symlink") via stat leggero.
-     */
-    private function statType(string $instance, string $path): string
-    {
-        try {
-            [$status, $headers] = $this->incus->headersOnly($this->base($instance), ['path' => $path]);
-            if ($status >= 400) {
-                return 'file';
-            }
-            return $headers['x-incus-type'] ?? 'file';
-        } catch (\Throwable) {
-            return 'file';
-        }
     }
 
     /**

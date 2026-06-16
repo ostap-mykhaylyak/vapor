@@ -25,13 +25,16 @@ class View
      */
     public static function partial(string $template, array $data = []): string
     {
-        $file = self::$viewPath . '/' . $template . '.php';
-        if (!is_file($file)) {
+        // Nome "oscuro" per non collidere con le chiavi dei dati della view
+        // (es. una view che usa $file): extract() con EXTR_SKIP non deve
+        // saltare le variabili della view a causa dei locali di questo metodo.
+        $__vapor_view_file = self::$viewPath . '/' . $template . '.php';
+        if (!is_file($__vapor_view_file)) {
             throw new \RuntimeException("View non trovata: $template");
         }
         extract($data, EXTR_SKIP);
         ob_start();
-        include $file;
+        include $__vapor_view_file;
         return ob_get_clean() ?: '';
     }
 
