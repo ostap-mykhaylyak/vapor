@@ -37,14 +37,23 @@ class FileController extends Controller
         $path     = $this->normalize($request->input('path', '/'));
         $file     = $this->files->read($instance, $path);
 
+        // Se è una directory (link cliccato per errore), torna al browser.
+        if (($file['type'] ?? '') === 'directory') {
+            return $this->redirect('/instances/' . rawurlencode($instance) . '/files?path=' . rawurlencode($path));
+        }
+
+        // File binario: niente modifica (evita corruzione al salvataggio).
+        $binary = str_contains($file['content'], "\0");
+
         if ($request->wantsJson()) {
-            return $this->json(['path' => $path] + $file);
+            return $this->json(['path' => $path, 'binary' => $binary] + $file);
         }
         return $this->view('files/edit', [
             'instance' => $instance,
             'path'     => $path,
             'parent'   => $this->parent($path),
             'file'     => $file,
+            'binary'   => $binary,
         ]);
     }
 

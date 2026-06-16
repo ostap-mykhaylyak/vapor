@@ -15,19 +15,16 @@
 
 return [
     // --- Connessione a Incus ---
+    // I server Incus/LXD sono gestiti dagli amministratori via web e salvati nel
+    // DB (tabella `servers`). Questo blocco è solo il fallback "vuoto" usato
+    // quando nessun server è ancora selezionato.
     'incus' => [
-        // Socket Unix locale (deploy sullo stesso host di Incus).
-        // In alternativa usare 'https' => 'https://host:8443' con certificato client.
-        'socket'      => getenv('INCUS_SOCKET') ?: '/var/lib/incus/unix.socket',
-        // Endpoint HTTPS opzionale (se non si usa il socket Unix).
-        'https'       => getenv('INCUS_HTTPS') ?: null,
-        // Certificato e chiave client per l'endpoint HTTPS.
-        'client_cert' => getenv('INCUS_CLIENT_CERT') ?: null,
-        'client_key'  => getenv('INCUS_CLIENT_KEY') ?: null,
-        // Verifica TLS del server (false solo in dev con cert self-signed).
-        'verify'      => filter_var(getenv('INCUS_VERIFY') ?: 'false', FILTER_VALIDATE_BOOL),
-        // Project Incus di default.
-        'project'     => getenv('INCUS_PROJECT') ?: 'default',
+        'socket'      => null,
+        'https'       => null,
+        'client_cert' => null,
+        'client_key'  => null,
+        'verify'      => false,
+        'project'     => 'default',
     ],
 
     // --- Autenticazione (login dashboard) ---
@@ -38,6 +35,9 @@ return [
         // Durata massima della sessione in secondi (default 8 ore).
         'session_ttl'  => (int)(getenv('VAPOR_SESSION_TTL') ?: 28800),
     ],
+
+    // Directory scrivibile per dati a runtime (DB, certificati dei server).
+    'storage' => getenv('VAPOR_STORAGE') ?: __DIR__ . '/../storage',
 
     // --- Server WebSocket per il terminale PTY ---
     'ws' => [

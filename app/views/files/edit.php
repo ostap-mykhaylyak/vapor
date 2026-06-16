@@ -5,6 +5,12 @@
 </div>
 <div class="breadcrumb"><code><?= View::e($path) ?></code> · mode <?= View::e($file['mode']) ?> · uid <?= View::e($file['uid']) ?></div>
 
+<?php if (!empty($binary)): ?>
+    <div class="notice">File binario (<?= strlen($file['content']) ?> byte): visualizzazione di sola lettura, la modifica è disabilitata.</div>
+    <div class="card">
+        <textarea class="editor" readonly spellcheck="false"><?= View::e(mb_convert_encoding(substr($file['content'], 0, 65536), 'UTF-8', 'UTF-8')) ?></textarea>
+    </div>
+<?php else: ?>
 <form class="card" method="post" action="<?= $base ?>/instances/<?= $enc ?>/files/write">
     <?= Csrf::field() ?>
     <input type="hidden" name="path" value="<?= View::e($path) ?>">
@@ -14,3 +20,4 @@
         <button class="btn primary">Salva</button>
     </div>
 </form>
+<?php endif; ?>

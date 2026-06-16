@@ -20,9 +20,12 @@ class FileService
     }
 
     /**
-     * Elenca il contenuto di una directory.
+     * Elenca il contenuto di una directory, con il tipo di ogni voce.
      *
-     * @return array{type:string,entries:array<int,array{name:string,path:string}>}
+     * L'API Incus per le directory restituisce solo i nomi: per sapere se ogni
+     * voce è file/cartella/symlink facciamo uno stat leggero (solo header).
+     *
+     * @return array{type:string,entries:array<int,array{name:string,path:string,type:string}>}
      */
     public function list(string $instance, string $path): array
     {
@@ -43,12 +46,41 @@ class FileService
         $entries = [];
         $prefix  = rtrim($path, '/') . '/';
         foreach ($names as $n) {
-            $entries[] = ['name' => $n, 'path' => $prefix . $n];
+            $childPath = $prefix . $n;
+            $entries[] = [
+                'name' => $n,
+                'path' => $childPath,
+                'type' => $this->statType($instance, $childPath),
+            ];
         }
-        // Ordine: prima cartelle (euristica: senza estensione), poi alfabetico.
-        usort($entries, fn($a, $b) => strcasecmp($a['name'], $b['name']));
+
+        // Ordine: prima le cartelle, poi alfabetico (case-insensitive).
+        usort($entries, function ($a, $b) {
+            $ad = $a['type'] === 'directory';
+            $bd = $b['type'] === 'directory';
+            if ($ad !== $bd) {
+                return $ad ? -1 : 1;
+            }
+            return strcasecmp($a['name'], $b['name']);
+        });
 
         return ['type' => 'directory', 'entries' => $entries];
+    }
+
+    /**
+     * Tipo di una entry ("directory" | "file" | "symlink") via stat leggero.
+     */
+    private function statType(string $instance, string $path): string
+    {
+        try {
+            [$status, $headers] = $this->incus->headersOnly($this->base($instance), ['path' => $path]);
+            if ($status >= 400) {
+                return 'file';
+            }
+            return $headers['x-incus-type'] ?? 'file';
+        } catch (\Throwable) {
+            return 'file';
+        }
     }
 
     /**

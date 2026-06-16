@@ -18,6 +18,10 @@ code{font-family:ui-monospace,Menlo,monospace;background:var(--panel-2);padding:
 .topbar nav a{color:var(--muted);font-weight:500}
 .topbar nav a:hover{color:var(--txt);text-decoration:none}
 .topbar .project{margin-left:auto;color:var(--muted);font-size:12px}
+.server-switch{margin-left:auto}
+.server-switch select{background:var(--panel-2);color:var(--txt);border:1px solid var(--line);
+    border-radius:7px;padding:6px 10px;font-size:13px;font-family:inherit}
+.server-switch + .user-menu{margin-left:18px}
 
 .container{max-width:1080px;margin:0 auto;padding:28px 24px}
 .page-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}

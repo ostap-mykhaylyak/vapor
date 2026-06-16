@@ -145,6 +145,57 @@ class IncusClient
     }
 
     /**
+     * Esegue una GET leggendo SOLO gli header e abortendo il download del
+     * corpo. Serve a conoscere il tipo (X-Incus-type) di una entry del file
+     * manager senza scaricare l'intero file.
+     *
+     * @return array{0:int,1:array<string,string>}
+     */
+    public function headersOnly(string $path, array $query = []): array
+    {
+        if (!isset($query['project']) && !str_contains($path, 'project=')) {
+            $query['project'] = $this->project;
+        }
+        $url = $path . (empty($query) ? '' : '?' . http_build_query($query));
+
+        $ch = curl_init();
+        if (!empty($this->cfg['https'])) {
+            curl_setopt($ch, CURLOPT_URL, rtrim($this->cfg['https'], '/') . $url);
+            if (!empty($this->cfg['client_cert'])) curl_setopt($ch, CURLOPT_SSLCERT, $this->cfg['client_cert']);
+            if (!empty($this->cfg['client_key']))  curl_setopt($ch, CURLOPT_SSLKEY, $this->cfg['client_key']);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, (bool)($this->cfg['verify'] ?? false));
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, ($this->cfg['verify'] ?? false) ? 2 : 0);
+        } else {
+            curl_setopt($ch, CURLOPT_UNIX_SOCKET_PATH, $this->cfg['socket']);
+            curl_setopt($ch, CURLOPT_URL, 'http://incus' . $url);
+        }
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'GET');
+        curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+
+        $respHeaders = [];
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($c, $header) use (&$respHeaders) {
+            $parts = explode(':', $header, 2);
+            if (count($parts) === 2) {
+                $respHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
+            }
+            return strlen($header);
+        });
+        // Ritornando 0 dal write callback libcurl aborta il trasferimento del
+        // corpo subito dopo gli header (CURLE_WRITE_ERROR, atteso).
+        curl_setopt($ch, CURLOPT_WRITEFUNCTION, fn($c, $data) => 0);
+
+        curl_exec($ch);
+        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $errno  = curl_errno($ch);
+        curl_close($ch);
+
+        if ($status === 0 && $errno !== 0 && $errno !== CURLE_WRITE_ERROR) {
+            throw new IncusException('Errore di connessione a Incus (' . $this->target() . ')');
+        }
+        return [$status, $respHeaders];
+    }
+
+    /**
      * Esegue una richiesta e decodifica l'envelope Incus.
      * Per le operations async attende il completamento se $wait è true.
      *

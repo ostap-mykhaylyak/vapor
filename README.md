@@ -15,6 +15,8 @@ che fa da proxy verso l'endpoint `exec` di Incus.
 - **Network forward** — gestione port forwarding lato rete (`/1.0/networks/{net}/forwards`).
 - **File manager** — browse, lettura/scrittura, upload, mkdir, delete dentro l'istanza.
 - **Terminale PTY** — shell interattiva via xterm.js, proxy WS → `exec` di Incus.
+- **Multi-server** — più server Incus/LXD aggiunti via web dall'admin (cert generato
+  e registrato con trust token); selettore del server attivo nella barra.
 - **Autenticazione e ruoli** — login su SQLite + sessioni; utenti `admin`/`user`.
 - **Multi-tenancy** — ogni utente vede e gestisce solo i propri container.
 - **Audit log** — tracciamento delle azioni sensibili.

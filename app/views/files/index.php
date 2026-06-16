@@ -32,11 +32,17 @@
             <tr><td>Questo path non è una directory.</td></tr>
         <?php elseif (empty($listing['entries'])): ?>
             <tr><td class="muted">Directory vuota.</td></tr>
-        <?php else: foreach ($listing['entries'] as $e): ?>
+        <?php else: foreach ($listing['entries'] as $e):
+            $isDir  = ($e['type'] ?? 'file') === 'directory';
+            $isLink = ($e['type'] ?? '') === 'symlink';
+            $icon   = $isDir ? '📁' : ($isLink ? '🔗' : '📄');
+            $href   = $isDir
+                ? $base . '/instances/' . $enc . '/files?path=' . rawurlencode($e['path'])
+                : $base . '/instances/' . $enc . '/files/read?path=' . rawurlencode($e['path']);
+        ?>
             <tr>
                 <td>
-                    <a href="<?= $base ?>/instances/<?= $enc ?>/files?path=<?= rawurlencode($e['path']) ?>">📁 <?= View::e($e['name']) ?></a>
-                    <a class="ghost" href="<?= $base ?>/instances/<?= $enc ?>/files/read?path=<?= rawurlencode($e['path']) ?>">apri come file</a>
+                    <a href="<?= $href ?>"><?= $icon ?> <?= View::e($e['name']) ?></a>
                 </td>
                 <td class="actions">
                     <form method="post" action="<?= $base ?>/instances/<?= $enc ?>/files/delete" onsubmit="return confirm('Eliminare <?= View::e($e['name']) ?>?')">

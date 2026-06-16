@@ -35,8 +35,11 @@ variabili a mano nella shell prima di lanciare `bin/vapor`.
 
 ```sh
 cp .env.example .env
-nano .env            # imposta almeno VAPOR_SECRET e, per HTTPS, INCUS_HTTPS + cert/key
+nano .env            # imposta almeno VAPOR_SECRET e i parametri del WebSocket
 ```
+
+> I server Incus/LXD **non** stanno nel `.env`: si aggiungono dal web (vedi
+> *Connessione a Incus*).
 
 **Precedenza:** il `.env` ha **priorità massima** e **sovrascrive** qualunque
 variabile d'ambiente già impostata (systemd, shell, inline). Ciò che non è nel
@@ -46,12 +49,7 @@ variabile d'ambiente già impostata (systemd, shell, inline). Ciò che non è ne
 
 | Variabile            | Default                              | Note |
 |----------------------|--------------------------------------|------|
-| `INCUS_SOCKET`       | `/var/lib/incus/unix.socket`         | Socket Unix locale |
-| `INCUS_PROJECT`      | `default`                            | Project Incus |
-| `INCUS_HTTPS`        | (vuoto)                              | Endpoint HTTPS; se valorizzato ignora il socket |
-| `INCUS_CLIENT_CERT`  | `storage/certs/client.crt`           | Certificato client (modalità HTTPS) |
-| `INCUS_CLIENT_KEY`   | `storage/certs/client.key`           | Chiave client (modalità HTTPS) |
-| `INCUS_VERIFY`       | `false`                              | Verifica TLS del server |
+| `VAPOR_STORAGE`      | `storage/`                           | Dir scrivibile: DB + certificati dei server |
 | `VAPOR_WS_HOST`      | `127.0.0.1`                          | Bind del server WebSocket |
 | `VAPOR_WS_PORT`      | `8090`                               | Porta del server WebSocket |
 | `VAPOR_WS_URL`       | `ws://127.0.0.1:8090`                | URL pubblico usato dal browser |
@@ -63,19 +61,23 @@ variabile d'ambiente già impostata (systemd, shell, inline). Ciò che non è ne
 
 ## Prima installazione (passo-passo)
 
+Installazione pulita, da zero (nessuna configurazione Incus nel `.env`).
+
 1. **Copia il codice** sull'host (es. `/opt/vapor`) — nessuna dipendenza da installare.
-2. **Crea il primo amministratore**:
+2. **Configura il `.env`**: `cp .env.example .env`, imposta `VAPOR_SECRET` (lungo e
+   casuale), `VAPOR_WS_URL`/`VAPOR_WS_ORIGINS` con l'host reale, `VAPOR_DEBUG=false`.
+3. **Permessi storage**: l'utente di PHP (es. `www-data`) deve poter scrivere
+   `storage/` (DB) e `storage/certs/` (certificati dei server):
+   `sudo chown -R www-data:www-data /opt/vapor/storage`.
+4. **Crea il primo amministratore**:
    `php bin/vapor user:add admin --admin` (vedi [Primo utente](#primo-utente)).
-3. **Collega Incus** scegliendo una modalità (vedi [Connessione a Incus](#connessione-a-incus)):
-   - **A)** socket Unix locale — Vapor sullo stesso host di Incus, nessun certificato;
-   - **B1)** HTTPS *fornendo il certificato* — `php bin/vapor cert:setup` (host con
-     accesso admin a Incus);
-   - **B2)** HTTPS *con trust token* — l'admin Incus esegue `incus config trust add vapor`
-     e tu lanci `php bin/vapor cert:setup --token=<trust-token>` (host remoto).
-4. **Imposta i segreti**: `VAPOR_SECRET` lungo e casuale (**identico** tra web e
-   terminal server), `VAPOR_WS_ORIGINS` con l'host reale, `VAPOR_DEBUG=false`.
 5. **Avvia** web server e terminal server (vedi [Avvio](#avvio) / [Deploy](#deploy-systemd)).
-6. **Apri la dashboard** e accedi con l'utente creato al punto 2.
+6. **Accedi** alla dashboard con l'utente del punto 4. Al primo accesso vieni
+   reindirizzato a **Server**: aggiungi il tuo primo server Incus/LXD con un trust
+   token (vedi [Connessione a Incus](#connessione-a-incus)).
+7. Da lì gestisci container, file, forward e terminale sul server selezionato. Puoi
+   aggiungere altri server in qualsiasi momento e passare dall'uno all'altro col
+   selettore nella barra.
 
 ## Primo utente
 
@@ -92,76 +94,39 @@ php bin/vapor user:del mario
 Gli admin possono poi gestire gli utenti dall'interfaccia (**Utenti** nella navbar).
 Il database SQLite viene creato automaticamente (`storage/vapor.sqlite`).
 
-## Connessione a Incus
+## Connessione a Incus (server gestiti dal web)
 
-Vapor può parlare con Incus in due modi: scegline uno.
+I server Incus/LXD si aggiungono **dall'interfaccia**, come amministratore, dal menu
+**Server** (`/admin/servers`). Vapor supporta **più server**: ognuno ha un endpoint
+HTTPS, un project e una coppia di certificati client generata automaticamente.
+La selezione del server attivo avviene dal **menu a tendina nella barra in alto**.
 
-### Opzione A — Socket Unix locale (default)
+### Aggiungere un server
 
-Se Vapor gira **sullo stesso host** di Incus non serve alcun certificato: è
-sufficiente che l'utente di PHP possa leggere `/var/lib/incus/unix.socket`
-(appartenenza al gruppo `incus-admin`). Nessuna variabile aggiuntiva.
+1. Sull'host Incus, da amministratore, genera un **trust token** monouso:
+   ```sh
+   incus config trust add <nome>      # stampa un trust token temporaneo
+   ```
+   (Assicurati che l'API HTTPS sia raggiungibile: `incus config set core.https_address :8443`.)
+2. In Vapor → **Server** → *Aggiungi server*: inserisci nome, URL
+   (`https://host:8443`), project e incolla il trust token.
+3. Vapor genera il certificato client (EC secp384r1, fallback RSA-4096) in
+   `storage/certs/<nome>/`, lo **registra** sul server tramite il token e salva il
+   server nel DB. Diventa subito selezionabile.
 
-### Opzione B — API HTTPS con certificato client
+> Spunta "Verifica certificato TLS" solo se il certificato del server è verificabile
+> dal CA di sistema; per i tipici certificati self-signed di Incus lascialo disattivo.
 
-Per collegarsi a Incus **via rete** serve un certificato client TLS registrato nel
-trust store di Incus. Vapor genera la coppia cert/chiave (EC secp384r1, fallback
-RSA-4096) in `storage/certs/`. La fiducia si stabilisce in uno di questi due modi.
+### Note
 
-**B1 — Fornendo il certificato** (host con accesso admin a Incus, es. il socket locale)
+- I dati dei server (URL, project, percorsi certificati) vivono nel **DB**, non nel
+  `.env`. Aggiungere/rimuovere server non richiede riavvii.
+- L'utente che esegue PHP deve poter **leggere e scrivere** `storage/certs/`
+  (è dove vengono salvati i certificati dei server).
+- Il primo server aggiunto diventa il **default**; puoi cambiarlo dalla lista.
 
-```sh
-php bin/vapor cert:setup            # genera la coppia E la registra nel trust store
-# equivalente ai due passi separati:
-php bin/vapor cert:generate --cn=vapor --days=3650
-php bin/vapor cert:install  --name=vapor
-```
-
-**B2 — Con trust token** (registrazione remota, senza accesso al socket)
-
-Sull'host di Incus, un amministratore genera un token monouso:
-
-```sh
-incus config trust add vapor        # stampa un trust token temporaneo
-```
-
-Su Vapor (host remoto): genera il certificato, **poi imposta l'endpoint HTTPS nel
-`.env`** (la registrazione col token avviene via HTTPS, non sul socket) e registrati.
-
-```sh
-php bin/vapor cert:generate --cn=vapor
-```
-
-Nel `.env` (così la CLI lo legge subito, senza export manuali):
-
-```sh
-INCUS_HTTPS=https://mio-host:8443
-INCUS_CLIENT_CERT=/opt/vapor/storage/certs/client.crt
-INCUS_CLIENT_KEY=/opt/vapor/storage/certs/client.key
-INCUS_VERIFY=false
-```
-
-Poi registra il certificato col token:
-
-```sh
-php bin/vapor cert:install --name=vapor --token=<trust-token>
-```
-
-> Se INCUS_HTTPS non è impostato, `cert:install --token` si ferma con un messaggio
-> esplicito (la registrazione con token richiede l'endpoint HTTPS).
-
-**Configurazione finale (B1 o B2)** — i percorsi sono quelli stampati dai comandi:
-
-```sh
-INCUS_HTTPS=https://mio-host:8443
-INCUS_CLIENT_CERT=/opt/vapor/storage/certs/client.crt
-INCUS_CLIENT_KEY=/opt/vapor/storage/certs/client.key
-INCUS_VERIFY=false        # true se il certificato del server è verificabile
-```
-
-Quando `INCUS_HTTPS` è valorizzato, il socket Unix viene ignorato (sia per le API
-REST sia per il WebSocket del terminale). La chiave privata è scritta con permessi
-`0600`; `storage/` è già escluso da git.
+> I comandi `cert:*` della CLI restano disponibili per usi manuali, ma per l'uso
+> normale la gestione dei server è interamente via web.
 
 ## Avvio
 

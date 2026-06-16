@@ -10,12 +10,20 @@ use Vapor\Controller\FileController;
 use Vapor\Controller\TerminalController;
 use Vapor\Controller\AuthController;
 use Vapor\Controller\AdminController;
+use Vapor\Controller\ServerController;
 
 return function (Router $r): void {
     // --- Autenticazione ---
     $r->get('/login',   [AuthController::class, 'showLogin']);
     $r->post('/login',  [AuthController::class, 'login']);
     $r->post('/logout', [AuthController::class, 'logout']);
+
+    // --- Server Incus/LXD ---
+    $r->post('/servers/switch',         [ServerController::class, 'switch']);   // qualsiasi utente
+    $r->get('/admin/servers',           [ServerController::class, 'index']);    // admin
+    $r->post('/admin/servers',          [ServerController::class, 'store']);
+    $r->post('/admin/servers/default',  [ServerController::class, 'setDefault']);
+    $r->post('/admin/servers/delete',   [ServerController::class, 'destroy']);
 
     // --- Gestione utenti (solo admin) ---
     $r->get('/admin/users',           [AdminController::class, 'users']);

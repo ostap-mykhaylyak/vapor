@@ -7,6 +7,7 @@ use Vapor\Audit\Audit;
 use Vapor\Incus\IncusClient;
 use Vapor\Incus\ExecService;
 use Vapor\Incus\InstanceService;
+use Vapor\Incus\ServerRepository;
 
 /**
  * Server WebSocket per il terminale PTY, in PHP puro (ext-sockets via stream).
@@ -178,8 +179,15 @@ class TerminalServer
 
         $instance = $claims['inst'];
 
+        // 2b) Carica la config del server Incus indicato nel token (multi-server).
+        $incusCfg = $this->serverConfig((int)($claims['srv'] ?? 0));
+        if ($incusCfg === null) {
+            $this->reject($conn, 'Server Incus non disponibile.');
+            return;
+        }
+
         // 3) Ri-verifica della proprietà contro Incus (difesa in profondità).
-        if (($claims['role'] ?? 'user') !== 'admin' && !$this->ownsInstance($claims['sub'], $instance)) {
+        if (($claims['role'] ?? 'user') !== 'admin' && !$this->ownsInstance($claims['sub'], $instance, $incusCfg)) {
             $this->reject($conn, 'Accesso al container non autorizzato.');
             return;
         }
@@ -192,10 +200,21 @@ class TerminalServer
             );
         } catch (\Throwable) {}
 
-        $session       = new Session($conn, $instance);
+        $session       = new Session($conn, $instance, $incusCfg);
         $conn->session = $session;
 
         $this->openIncusSession($session, (int)($query['cols'] ?? 80), (int)($query['rows'] ?? 24));
+    }
+
+    /** Config IncusClient del server indicato, o null se assente. */
+    private function serverConfig(int $serverId): ?array
+    {
+        try {
+            $row = (new ServerRepository($this->config['auth']))->find($serverId);
+        } catch (\Throwable) {
+            return null;
+        }
+        return $row ? ServerRepository::toClientConfig($row) : null;
     }
 
     /** Verifica che l'header Origin sia tra quelli consentiti (se configurati). */
@@ -212,10 +231,10 @@ class TerminalServer
     }
 
     /** True se l'istanza Incus è marcata come di proprietà dell'utente. */
-    private function ownsInstance(string $username, string $instance): bool
+    private function ownsInstance(string $username, string $instance, array $incusCfg): bool
     {
         try {
-            $incus = new IncusClient($this->config['incus']);
+            $incus = new IncusClient($incusCfg);
             $owner = (new InstanceService($incus))->ownerOf($instance);
         } catch (\Throwable $e) {
             return false;
@@ -236,7 +255,7 @@ class TerminalServer
     private function openIncusSession(Session $session, int $cols, int $rows): void
     {
         try {
-            $incus = new IncusClient($this->config['incus']);
+            $incus = new IncusClient($session->incusCfg);
             $op    = (new ExecService($incus))->start($session->instance, [
                 'width'  => $cols,
                 'height' => $rows,
@@ -264,21 +283,22 @@ class TerminalServer
      */
     private function openIncusWs(string $opId, string $secret, string $role, Session $session): Conn
     {
-        $useHttps = !empty($this->config['incus']['https']);
+        $cfg      = $session->incusCfg;
+        $useHttps = !empty($cfg['https']);
         $path     = "/1.0/operations/$opId/websocket?secret=$secret";
 
         if ($useHttps) {
-            $base = preg_replace('#^https?://#', '', rtrim($this->config['incus']['https'], '/'));
+            $base = preg_replace('#^https?://#', '', rtrim($cfg['https'], '/'));
             $ctx  = stream_context_create(['ssl' => [
-                'verify_peer'      => (bool)($this->config['incus']['verify'] ?? false),
-                'verify_peer_name' => (bool)($this->config['incus']['verify'] ?? false),
-                'local_cert'       => $this->config['incus']['client_cert'] ?? null,
-                'local_pk'         => $this->config['incus']['client_key'] ?? null,
+                'verify_peer'      => (bool)($cfg['verify'] ?? false),
+                'verify_peer_name' => (bool)($cfg['verify'] ?? false),
+                'local_cert'       => $cfg['client_cert'] ?? null,
+                'local_pk'         => $cfg['client_key'] ?? null,
             ]]);
             $stream = @stream_socket_client("ssl://$base", $errno, $errstr, 5, STREAM_CLIENT_CONNECT, $ctx);
-            $hostHeader = parse_url($this->config['incus']['https'], PHP_URL_HOST) ?: 'incus';
+            $hostHeader = parse_url($cfg['https'], PHP_URL_HOST) ?: 'incus';
         } else {
-            $sock   = $this->config['incus']['socket'];
+            $sock   = $cfg['socket'];
             $stream = @stream_socket_client("unix://$sock", $errno, $errstr, 5);
             $hostHeader = 'incus';
         }

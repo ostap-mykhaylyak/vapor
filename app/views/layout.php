@@ -16,11 +16,24 @@
         <a href="<?= $base ?>/instances">Istanze</a>
         <?php if (!empty($isAdmin)): ?>
             <a href="<?= $base ?>/forwards">Forward</a>
+            <a href="<?= $base ?>/admin/servers">Server</a>
             <a href="<?= $base ?>/admin/users">Utenti</a>
             <a href="<?= $base ?>/admin/audit">Audit</a>
         <?php endif; ?>
     </nav>
-    <span class="project">project: <?= View::e($config['incus']['project']) ?></span>
+    <?php $servers = $config['_servers'] ?? []; $current = $config['_current_server'] ?? null; ?>
+    <?php if (!empty($authUser) && !empty($servers)): ?>
+        <form method="post" action="<?= $base ?>/servers/switch" class="server-switch">
+            <?= Csrf::field() ?>
+            <select name="id" onchange="this.form.submit()" title="Server attivo">
+                <?php foreach ($servers as $s): ?>
+                    <option value="<?= (int)$s['id'] ?>" <?= ($current && $current['id'] == $s['id']) ? 'selected' : '' ?>>
+                        <?= View::e($s['name']) ?> · <?= View::e($s['project']) ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </form>
+    <?php endif; ?>
     <?php if (!empty($authUser)): ?>
         <div class="user-menu">
             <span class="user"><?= View::e($authUser['username']) ?><?= !empty($isAdmin) ? ' · admin' : '' ?></span>

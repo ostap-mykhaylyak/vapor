@@ -10,7 +10,13 @@ class Session
     public ?Conn $data    = null;   // fd "0": stdin/stdout del PTY
     public ?Conn $control = null;   // canale di controllo (resize/segnali)
 
-    public function __construct(public Conn $browser, public string $instance)
-    {
+    /**
+     * @param array $incusCfg config del server Incus (multi-server) per questa sessione
+     */
+    public function __construct(
+        public Conn $browser,
+        public string $instance,
+        public array $incusCfg = [],
+    ) {
     }
 }

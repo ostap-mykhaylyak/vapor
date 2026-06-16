@@ -63,6 +63,7 @@ class TerminalController extends Controller
             'sub'  => $user['username'],
             'role' => $user['role'] ?? 'user',
             'inst' => $instance,
+            'srv'  => (int)($_SESSION['vapor_server'] ?? 0),  // server attivo
         ], $ttl);
 
         $this->auth()->storeTerminalToken($jti, $user['username'], $instance, time() + $ttl);
